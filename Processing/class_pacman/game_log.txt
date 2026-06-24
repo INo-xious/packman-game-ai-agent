@@ -1,0 +1,2 @@
+Game #1 | 2026-06-24 13:30:20 | Result: LOSE | Score: 2120 | Lives left: 0 | Dots eaten: 120/151
+Game #1 | 2026-06-24 13:31:52 | Result: LOSE | Score: 1010 | Lives left: 0 | Dots eaten: 37/151

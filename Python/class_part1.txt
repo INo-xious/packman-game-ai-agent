@@ -1,0 +1,121 @@
+import socket
+import json
+import random
+from collections import deque
+
+DIRS = {
+    'UP': (-1, 0),
+    'DOWN': (1, 0),
+    'LEFT': (0, -1),
+    'RIGHT': (0, 1)
+}
+
+def get_best_move(state):
+    """
+    Analyzes the game state and returns the best move.
+    Uses BFS to find nearest dot while avoiding ghosts.
+    When powered, chases frightened ghosts for bonus points.
+    """
+    maze = state['maze']
+    pr = state['pacman']['grid_r']
+    pc = state['pacman']['grid_c']
+    ghosts = state['ghosts']
+    powered = state.get('powered', False)
+
+    rows = len(maze)
+    cols = len(maze[0])
+
+    # 1. Identify danger zones (only non-frightened, non-eaten ghosts)
+    danger_zones = set()
+    frightened_positions = set()
+
+    for g in ghosts:
+        gr, gc = g['grid_r'], g['grid_c']
+        if g['frightened'] and not g['eaten']:
+            frightened_positions.add((gr, gc))
+        elif not g['eaten']:
+            danger_zones.add((gr, gc))
+            for dr, dc in DIRS.values():
+                danger_zones.add((gr + dr, gc + dc))
+
+    # 2. If powered, try to chase the nearest frightened ghost
+    if powered and frightened_positions:
+        result = bfs_to_targets(pr, pc, maze, rows, cols, danger_zones, frightened_positions)
+        if result:
+            return result
+
+    # 3. Normal mode: BFS to nearest dot or power pellet
+    result = bfs_to_food(pr, pc, maze, rows, cols, danger_zones)
+    if result:
+        return result
+
+    # 4. Relax: BFS ignoring expanded danger zones (just avoid ghost cells)
+    slim_danger = set()
+    for g in ghosts:
+        if not g['frightened'] and not g['eaten']:
+            slim_danger.add((g['grid_r'], g['grid_c']))
+
+    result = bfs_to_food(pr, pc, maze, rows, cols, slim_danger)
+    if result:
+        return result
+
+    # 5. Desperation: BFS with NO danger zones at all
+    result = bfs_to_food(pr, pc, maze, rows, cols, set())
+    if result:
+        return result
+
+    # 6. Last resort: any non-wall move
+    for d_name, (dr, dc) in DIRS.items():
+        nr, nc = pr + dr, pc + dc
+        if nc < 0: nc = cols - 1
+        if nc >= cols: nc = 0
+        if 0 <= nr < rows and maze[nr][nc] != 1:
+            return d_name
+
+    return "UP"
+
+
+def bfs_to_food(pr, pc, maze, rows, cols, danger_zones):
+    """BFS to find closest dot (0) or power pellet (2)."""
+    return _bfs(pr, pc, maze, rows, cols, danger_zones,
+                target_check=lambda r, c: maze[r][c] in [0, 2])
+
+
+def bfs_to_targets(pr, pc, maze, rows, cols, danger_zones, target_set):
+    """BFS to find closest cell in target_set."""
+    return _bfs(pr, pc, maze, rows, cols, danger_zones,
+                target_check=lambda r, c: (r, c) in target_set)
+
+
+def _bfs(pr, pc, maze, rows, cols, danger_zones, target_check):
+    """Generic BFS returning the first move direction toward the nearest target."""
+    queue = deque()
+    visited = set()
+    visited.add((pr, pc))
+
+    for d_name, (dr, dc) in DIRS.items():
+        nr, nc = pr + dr, pc + dc
+        if nc < 0: nc = cols - 1
+        if nc >= cols: nc = 0
+        if 0 <= nr < rows and maze[nr][nc] != 1 and (nr, nc) not in danger_zones:
+            if target_check(nr, nc):
+                return d_name
+            queue.append((nr, nc, d_name))
+            visited.add((nr, nc))
+
+    while queue:
+        curr_r, curr_c, first_move = queue.popleft()
+        if target_check(curr_r, curr_c):
+            return first_move
+        for dr, dc in DIRS.values():
+            nr, nc = curr_r + dr, curr_c + dc
+            if nc < 0: nc = cols - 1
+            if nc >= cols: nc = 0
+            if 0 <= nr < rows and maze[nr][nc] != 1 and (nr, nc) not in visited and (nr, nc) not in danger_zones:
+                visited.add((nr, nc))
+                queue.append((nr, nc, first_move))
+
+    return None  # No path found
+
+
+print("AI Logic loaded! Ready to connect.")

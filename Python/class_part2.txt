@@ -1,0 +1,69 @@
+import time
+
+# --- Connect to the Processing server on 127.0.0.1:5204 ---
+s = None
+reader = None
+writer = None
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(10)          # 10-second timeout for connection & reads
+    # Note: 127.0.0.1 is used instead of 'localhost' to prevent connection errors on Mac
+    s.connect(("127.0.0.1", 5204))
+    reader = s.makefile("r")  # Separate read buffer
+    writer = s.makefile("w")  # Separate write buffer
+    print("Successfully connected to Processing Game!")
+except (ConnectionRefusedError, OSError, TimeoutError) as e:
+    print(f"ERROR: Could not connect — {e}")
+    print("Is the Processing sketch running?")
+    if s:
+        s.close()
+    s = None
+
+if s:
+    start_sent = False  # Track whether we already sent START for this non-playing state
+    try:
+        while True:
+            # 1. Read the JSON state from Processing
+            try:
+                line = reader.readline()
+            except socket.timeout:
+                print("WARNING: No data received (timeout). Retrying...")
+                continue
+
+            if not line:
+                print("Server closed the connection.")
+                break
+
+            # 2. Parse the JSON
+            try:
+                state = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # Skip broken packets
+
+            # 3. Decide what to do
+            if state["gameState"] != 1:
+                if not start_sent:
+                    action = "START"
+                    start_sent = True
+                else:
+                    # Already sent START; just keep reading until game resumes
+                    action = "START"
+            else:
+                start_sent = False  # Game is active again, reset the flag
+                action = get_best_move(state)
+
+            # 4. Send the command back to Processing
+            command = json.dumps({"action": action})
+            writer.write(command + "\n")
+            writer.flush()
+
+    except KeyboardInterrupt:
+        print("\nAI Stopped by User.")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+    finally:
+        reader.close()
+        writer.close()
+        s.close()
+        print("Connection closed.")
