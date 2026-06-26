@@ -1,121 +1,3463 @@
-import socket
-import json
-import random
+import itertools
+import math
+import heapq
 from collections import deque
 
+
 DIRS = {
-    'UP': (-1, 0),
-    'DOWN': (1, 0),
-    'LEFT': (0, -1),
-    'RIGHT': (0, 1)
+    "UP": (-1, 0),
+    "DOWN": (1, 0),
+    "LEFT": (0, -1),
+    "RIGHT": (0, 1),
 }
 
+MOVE_ORDER = ("UP", "LEFT", "DOWN", "RIGHT")
+OPPOSITE = {
+    "UP": "DOWN",
+    "DOWN": "UP",
+    "LEFT": "RIGHT",
+    "RIGHT": "LEFT",
+}
+
+CELL = 30.0
+PACMAN_SPEED = 2.0
+NORMAL_GHOST_SPEED = 1.5
+FRIGHTENED_GHOST_SPEED = 0.8
+EATEN_GHOST_SPEED = 3.0
+COLLISION_RADIUS = CELL * 0.75
+POWER_FRAMES = 300
+STRIKE_MARGIN = 1.5
+STRIKE_RADIUS = COLLISION_RADIUS - STRIKE_MARGIN
+COMMIT_TOTAL_BUDGET = 280
+COMMIT_FIRST_CAPTURE_BUDGET = 90
+SETUP_STALL_LIMIT = 90
+PELLET_BLACKLIST_FRAMES = 180
+HUNT_STICKY_FRAMES = 12
+HUNT_SWITCH_ADVANTAGE = 18
+HUNT_NEAR_DIRECT_STEPS = 5
+HUNT_TIMER_MARGIN = 6
+HUNT_RECENT_PIXEL_WEIGHT = 0.15
+HUNT_PRESSURE_MIN_TIMER = 24
+HUNT_ACTION_STICKY_FRAMES = 10
+HUNT_DIRECT_PIXEL_RADIUS = CELL * 6.0
+HUNT_TARGET_PROGRESS_WEIGHT = 62.0
+HUNT_PIXEL_PROGRESS_WEIGHT = 2.4
+HUNT_GHOST_PIXEL_WEIGHT = 2.2
+HUNT_ACTION_SWITCH_ADVANTAGE = 42.0
+TRAP_HORIZON_FRAMES = 135.0
+TRAP_ROUTE_COST_SCALE = 0.018
+TRAP_TARGET_COST_SCALE = 0.055
+TRAP_ACTION_COST_SCALE = 0.35
+TRAP_EMERGENCY_RISK = 95.0
+TRAP_SEVERE_RISK = 145.0
+TRAP_DEAD_END_WEIGHT = 18.0
+TRAP_EXIT_COVER_FRAMES = 95.0
+
+
+class PacmanPlanner:
+    """Stateful survival-first planner for the supplied Processing game."""
+
+    def __init__(self):
+        self.rows = 0
+        self.cols = 0
+        self.wall_signature = None
+        self.topology_neighbors = {}
+        self.topology_distances = {}
+        self.dead_end_depth = {}
+        self.reserve_dot = None
+        self.activation_plan_cache = {}
+
+        self.mode = "CLEAR"
+        self.target = None
+        self.target_pellet = None
+        self.hunt_target = None
+        self.hunt_order = []
+        self.hunt_captured = set()
+        self.hunt_active = False
+        self.hunt_start_timer = 0
+        self.hunt_last_timer = 0
+        self.hunt_replan_needed = False
+        self.hunt_focus_id = None
+        self.hunt_focus_frames = 0
+        self.hunt_focus_cell = None
+        self.hunt_focus_eta = None
+        self.hunt_last_action = None
+        self.hunt_action_frames = 0
+        self.pending_hunt_order = []
+        self.pending_hunt_pellet = None
+        self.pending_hunt_frames = None
+        self.patrol_index = 0
+        self.herd_phase = "ACQUIRE"
+        self.herd_ghost = None
+        self.herd_phase_frames = 0
+        self.herd_pellet = None
+        self.prepare_pellet = None
+        self.prepare_lane = None
+        self.prepare_frames = 0
+        self.prepare_best_deficit = float("inf")
+        self.setup_pellet = None
+        self.setup_best_metric = float("inf")
+        self.setup_stall_frames = 0
+        self.pellet_blacklist = {}
+        self.tow_ghost_id = None
+        self.tow_pellet = None
+        self.tow_route = []
+        self.tow_waypoint = None
+        self.tow_alignment = "LOST"
+        self.tow_lost_frames = 0
+
+        self.previous_lives = None
+        self.previous_powered = False
+        self.previous_pellets = None
+        self.previous_score = None
+        self.pellets_used = 0
+        self.capture_count = 0
+        self.recent_pixels = deque(maxlen=90)
+        self.decision_frame = 0
+
+    # ------------------------------------------------------------------
+    # Public decision entry point
+    # ------------------------------------------------------------------
+
+    def choose(self, state):
+        self.decision_frame += 1
+        self._expire_pellet_blacklist()
+
+        maze = state.get("maze") or []
+        pac = state.get("pacman") or {}
+        ghosts = state.get("ghosts") or []
+        if not maze or not maze[0]:
+            return "UP"
+
+        self._prepare_map(maze)
+        self._observe_state(state)
+
+        pac_cell = self._object_cell(pac)
+        pac_pixel = self._object_pixel(pac)
+        if not self._walkable(pac_cell, maze):
+            return self._heading(pac) or "UP"
+
+        self.recent_pixels.append(
+            (round(pac_pixel[0], 1), round(pac_pixel[1], 1))
+        )
+
+        power_pellets = self._find_cells(maze, 2)
+        dots = self._find_cells(maze, 0)
+        # Keep the Processing array index attached to every edible ghost.
+        # Filtering the list must never renumber identities after a capture.
+        edible = [
+            (ghost_id, ghost)
+            for ghost_id, ghost in enumerate(ghosts)
+            if ghost.get("frightened", False) and not ghost.get("eaten", False)
+        ]
+        dangerous = [
+            g for g in ghosts
+            if not g.get("frightened", False) and not g.get("eaten", False)
+        ]
+
+        activation_open = (
+            not self.hunt_active
+            and (
+                not state.get("powered", False)
+                or len(self.hunt_captured) >= 4
+            )
+        )
+        commit = (
+            self._practical_commit_action(
+                state, power_pellets, maze
+            )
+            if activation_open else None
+        )
+        if commit is not None:
+            action, pellet, plan = commit
+            self.mode = "COMMIT"
+            self.target = pellet
+            self.target_pellet = pellet
+            self.pending_hunt_pellet = pellet
+            self.pending_hunt_order = list(plan["order"])
+            self.pending_hunt_frames = plan["total"]
+            self._clear_prepare()
+            # This is the only path that can enter a power pellet. It requires
+            # all four identities, all 24 orders, an early first capture, and
+            # a conservative fourth capture before frame 280.
+            return action
+
+        mode, target = self._select_mode_and_target(
+            state,
+            pac_cell,
+            power_pellets,
+            dots,
+            edible,
+            dangerous,
+            maze,
+        )
+        self.mode = mode
+        self.target = target
+
+        blocked = set()
+        # Pellet cells remain forbidden in every ordinary/setup mode. COMMIT
+        # returns above only after proving a complete four-ghost pursuit.
+        blocked.update(power_pellets)
+        if self.reserve_dot is not None and mode != "ENDGAME":
+            blocked.add(self.reserve_dot)
+
+        if mode == "PREPARE":
+            return self._choose_prepare_action(
+                state, blocked, maze
+            )
+
+        desired = self._desired_direction(
+            pac_cell,
+            target,
+            maze,
+            ghosts,
+            blocked,
+            mode,
+        )
+
+        return self._choose_pixel_safe_action(
+            state,
+            desired,
+            target,
+            blocked,
+            mode,
+        )
+
+    # ------------------------------------------------------------------
+    # State and map bookkeeping
+    # ------------------------------------------------------------------
+
+    def _prepare_map(self, maze):
+        signature = tuple(
+            tuple(value == 1 for value in row)
+            for row in maze
+        )
+        if signature == self.wall_signature:
+            return
+
+        self.rows = len(maze)
+        self.cols = len(maze[0])
+        self.wall_signature = signature
+        open_cells = tuple(self._open_cells(maze))
+        self.topology_neighbors = {
+            cell: tuple(self._uncached_neighbors(cell, maze))
+            for cell in open_cells
+        }
+        self.dead_end_depth = self._build_dead_end_depth(maze)
+        self.topology_distances = {
+            cell: self._distance_map_from(cell, maze)
+            for cell in open_cells
+        }
+        self.activation_plan_cache.clear()
+
+        initial_dots = self._find_cells(maze, 0)
+        dead_dots = [
+            cell for cell in initial_dots
+            if self.dead_end_depth.get(cell, 0) > 0
+        ]
+        if dead_dots:
+            # Keep a remote dead-end dot so the game cannot end before the
+            # fourth pellet's ghost hunt is complete.
+            pellets = self._find_cells(maze, 2)
+            self.reserve_dot = max(
+                dead_dots,
+                key=lambda cell: (
+                    min(
+                        (self._distance(cell, p, maze) for p in pellets),
+                        default=0,
+                    ),
+                    self.dead_end_depth.get(cell, 0),
+                    cell,
+                ),
+            )
+
+    def _observe_state(self, state):
+        lives = state.get("lives", 3)
+        powered = bool(state.get("powered", False))
+        score = state.get("score", 0)
+        pellets = len(self._find_cells(state["maze"], 2))
+
+        if self.previous_lives is not None and lives < self.previous_lives:
+            self._reset_after_life_loss()
+
+        map_restarted = (
+            self.previous_score is not None
+            and score < self.previous_score
+        ) or (
+            self.previous_pellets is not None
+            and pellets > self.previous_pellets
+        )
+        if map_restarted:
+            self._reset_after_life_loss()
+
+        pellet_consumed = (
+            self.previous_pellets is not None
+            and pellets < self.previous_pellets
+        )
+        if pellet_consumed:
+            self.pellets_used += self.previous_pellets - pellets
+            self._clear_prepare()
+            self._begin_hunt(state)
+        elif (
+            self.prepare_pellet is not None
+            and self.prepare_pellet not in self._find_cells(state["maze"], 2)
+        ):
+            self._clear_prepare()
+
+        if self.hunt_active:
+            captured_before = set(self.hunt_captured)
+            for ghost_id, ghost in enumerate(state.get("ghosts") or []):
+                if ghost.get("eaten", False):
+                    self.hunt_captured.add(ghost_id)
+            if self.hunt_captured != captured_before:
+                self.hunt_replan_needed = True
+                self._clear_hunt_focus()
+
+            if len(self.hunt_captured) >= 4:
+                self.hunt_active = False
+                self.hunt_target = None
+                self.hunt_replan_needed = False
+                self._clear_hunt_focus()
+            elif not powered:
+                self._clear_hunt()
+            else:
+                self.hunt_last_timer = state.get("powerTimer", 0)
+                if self.hunt_target in self.hunt_captured:
+                    self.hunt_target = None
+                if self.hunt_focus_id in self.hunt_captured:
+                    self._clear_hunt_focus()
+
+        if self.previous_score is not None:
+            delta = score - self.previous_score
+            # Score packets arrive after collision checks. A 200-point component
+            # identifies captures even when a dot is eaten in the same frame.
+            if delta >= 200:
+                self.capture_count += delta // 200
+
+        if self.previous_powered and not powered and self.hunt_active:
+            self._clear_hunt()
+
+        self.previous_lives = lives
+        self.previous_powered = powered
+        self.previous_pellets = pellets
+        self.previous_score = score
+
+    def _begin_hunt(self, state):
+        ghost_ids = set(range(len(state.get("ghosts") or [])))
+        pending = [
+            ghost_id for ghost_id in self.pending_hunt_order
+            if ghost_id in ghost_ids
+        ]
+        if len(pending) != len(ghost_ids):
+            indexed = list(enumerate(state.get("ghosts") or []))
+            plan = self._plan_capture_chain(
+                self._object_cell(state["pacman"]),
+                indexed,
+                state["maze"],
+            )
+            pending = list(plan[3]) if plan is not None else sorted(ghost_ids)
+
+        self.hunt_order = pending
+        self.hunt_captured = set()
+        self.hunt_active = bool(pending)
+        self.hunt_target = pending[0] if pending else None
+        self.hunt_start_timer = state.get("powerTimer", POWER_FRAMES)
+        self.hunt_last_timer = self.hunt_start_timer
+        self.hunt_replan_needed = False
+        self._clear_hunt_focus()
+        self.pending_hunt_order = []
+        self.pending_hunt_pellet = None
+        self.pending_hunt_frames = None
+
+    def _clear_hunt(self):
+        self.hunt_target = None
+        self.hunt_order = []
+        self.hunt_captured = set()
+        self.hunt_active = False
+        self.hunt_start_timer = 0
+        self.hunt_last_timer = 0
+        self.hunt_replan_needed = False
+        self._clear_hunt_focus()
+
+    def _clear_hunt_focus(self):
+        self.hunt_focus_id = None
+        self.hunt_focus_frames = 0
+        self.hunt_focus_cell = None
+        self.hunt_focus_eta = None
+        self.hunt_last_action = None
+        self.hunt_action_frames = 0
+
+    def _next_ordered_hunt_target(self):
+        for ghost_id in self.hunt_order:
+            if ghost_id not in self.hunt_captured:
+                return ghost_id
+        return None
+
+    def _clear_prepare(self):
+        self.prepare_pellet = None
+        self.prepare_lane = None
+        self.prepare_frames = 0
+        self.prepare_best_deficit = float("inf")
+
+    def _clear_setup_tracking(self):
+        self.setup_pellet = None
+        self.setup_best_metric = float("inf")
+        self.setup_stall_frames = 0
+
+    def _expire_pellet_blacklist(self):
+        expired = [
+            pellet
+            for pellet, expiry in self.pellet_blacklist.items()
+            if expiry <= self.decision_frame
+        ]
+        for pellet in expired:
+            del self.pellet_blacklist[pellet]
+
+    def _blacklist_setup_pellet(self, pellet):
+        self.pellet_blacklist[pellet] = (
+            self.decision_frame + PELLET_BLACKLIST_FRAMES
+        )
+        if self.prepare_pellet == pellet:
+            self._clear_prepare()
+        if self.tow_pellet == pellet:
+            self._clear_tow()
+        self._clear_setup_tracking()
+
+    def _clear_tow(self):
+        self.tow_ghost_id = None
+        self.tow_pellet = None
+        self.tow_route = []
+        self.tow_waypoint = None
+        self.tow_alignment = "LOST"
+        self.tow_lost_frames = 0
+
+    def _reset_after_life_loss(self):
+        self.mode = "CLEAR"
+        self.target = None
+        self.target_pellet = None
+        self._clear_hunt()
+        self._clear_prepare()
+        self._clear_setup_tracking()
+        self._clear_tow()
+        self.pellet_blacklist.clear()
+        self.activation_plan_cache.clear()
+        self.pending_hunt_order = []
+        self.pending_hunt_pellet = None
+        self.pending_hunt_frames = None
+        self.patrol_index = 0
+        self.herd_phase = "ACQUIRE"
+        self.herd_ghost = None
+        self.herd_phase_frames = 0
+        self.herd_pellet = None
+        self.recent_pixels.clear()
+
+    # ------------------------------------------------------------------
+    # High-level behavior modes
+    # ------------------------------------------------------------------
+
+    def _select_mode_and_target(
+        self,
+        state,
+        pac_cell,
+        power_pellets,
+        dots,
+        edible,
+        dangerous,
+        maze,
+    ):
+        powered = bool(state.get("powered", False))
+
+        ordinary_targets = set(dots)
+        if self.reserve_dot in ordinary_targets:
+            ordinary_targets.remove(self.reserve_dot)
+
+        if powered and edible:
+            target = self._choose_frightened_intercept(
+                state, pac_cell, edible, maze
+            )
+            if target is not None:
+                return "HUNT", target
+            if state.get("powerTimer", 0) >= HUNT_PRESSURE_MIN_TIMER:
+                target = self._pressure_hunt_target(
+                    pac_cell, edible, maze
+                )
+                if target is not None:
+                    return "HUNT", target
+            self._clear_hunt_focus()
+            target = self._safest_food_target(
+                pac_cell,
+                ordinary_targets,
+                dangerous,
+                maze,
+            )
+            return "CLEAR", target
+
+        if power_pellets:
+            eligible_pellets = {
+                pellet for pellet in power_pellets
+                if pellet not in self.pellet_blacklist
+            }
+            if not eligible_pellets:
+                self._clear_prepare()
+                self._clear_tow()
+                self._clear_setup_tracking()
+                target = self._safest_food_target(
+                    pac_cell,
+                    ordinary_targets,
+                    dangerous,
+                    maze,
+                )
+                return "CLEAR", target
+
+            pellet = (
+                self.setup_pellet
+                if self.setup_pellet in eligible_pellets
+                else None
+            )
+            if pellet is None:
+                pellet = self._choose_herd_pellet(
+                    pac_cell, eligible_pellets, state["ghosts"], maze
+                )
+
+            self.target_pellet = pellet
+            ready = self._ready_activation_lane(state, pellet, maze)
+            stalled = self._update_setup_progress(
+                state, pellet, ready, maze
+            )
+            if stalled:
+                self._blacklist_setup_pellet(pellet)
+                remaining = eligible_pellets - {pellet}
+                if remaining:
+                    pellet = self._choose_herd_pellet(
+                        pac_cell, remaining, state["ghosts"], maze
+                    )
+                    self.target_pellet = pellet
+                    ready = self._ready_activation_lane(
+                        state, pellet, maze
+                    )
+                    self._update_setup_progress(
+                        state, pellet, ready, maze
+                    )
+                else:
+                    target = self._safest_food_target(
+                        pac_cell,
+                        ordinary_targets,
+                        dangerous,
+                        maze,
+                    )
+                    return "CLEAR", target
+
+            # Survival never weakens the activation rule. If setup becomes
+            # dangerous, temporarily collect a safe dot or move away while
+            # every power-pellet tile remains blocked.
+            if self._early_danger(state):
+                target = self._safest_food_target(
+                    pac_cell,
+                    ordinary_targets,
+                    dangerous,
+                    maze,
+                )
+                if target is not None:
+                    return "CLEAR", target
+
+            if ready is not None:
+                self._clear_tow()
+                plan, lane = ready
+                if (
+                    self.prepare_pellet != pellet
+                    or self.prepare_lane != lane
+                ):
+                    self.prepare_pellet = pellet
+                    self.prepare_lane = lane
+                    self.prepare_frames = 0
+                    self.prepare_best_deficit = float("inf")
+                if self.prepare_lane is not None:
+                    self.prepare_frames += 1
+                    return "PREPARE", self.prepare_lane[0]
+
+            if self.prepare_pellet is not None:
+                self._clear_prepare()
+
+            # Until a strict activation route exists, tow the farthest active
+            # ghost toward the selected pellet.
+            target = self._choose_active_herd_target(
+                state, pac_cell, pellet, maze
+            )
+            return self.herd_phase, target
+
+        # No pellets remain. Finish any still-active frightened hunt first.
+        if edible:
+            target = self._choose_frightened_intercept(
+                state, pac_cell, edible, maze
+            )
+            return "HUNT", target
+
+        if ordinary_targets:
+            target = self._safest_food_target(
+                pac_cell,
+                ordinary_targets,
+                dangerous,
+                maze,
+            )
+            return "CLEAR", target
+
+        if self.reserve_dot is not None and self.reserve_dot in dots:
+            return "ENDGAME", self.reserve_dot
+
+        return "ENDGAME", self._nearest_cell(pac_cell, dots, maze)
+
+    def _strike_ghost_next_pixel(self, ghost, maze):
+        # Pellet handling runs before Ghost.update(): every ghost is revived,
+        # marked frightened, and therefore moves at exactly 0.8 px this frame.
+        x, y = self._object_pixel(ghost)
+        dx = float(ghost.get("dx", 0))
+        dy = float(ghost.get("dy", 0))
+        nx = self._wrap_x(x + dx * FRIGHTENED_GHOST_SPEED)
+        ny = y + dy * FRIGHTENED_GHOST_SPEED
+        if self._pixel_walkable(nx, ny, maze):
+            return nx, ny
+
+        # Processing calls chooseDirection after finding the wall, but does not
+        # move the ghost again until the following frame.
+        return x, y
+
+    def _practical_commit_action(self, state, pellets, maze):
+        ghosts = state.get("ghosts") or []
+        if len(ghosts) != 4 or not pellets:
+            return None
+
+        pac = state.get("pacman") or {}
+        candidates = []
+        for action in MOVE_ORDER:
+            pac_trace = self._simulate_pac_trace(
+                pac, action, maze, frames=1
+            )
+            if not pac_trace:
+                continue
+            pac_next = pac_trace[0]
+            pellet = self._pixel_cell(pac_next)
+            if pellet not in pellets:
+                continue
+            if pellet in self.pellet_blacklist:
+                continue
+
+            lane_plans = self._activation_lane_plans(
+                state, pellet, maze
+            )
+            lane_result = lane_plans.get(action)
+            if lane_result is None:
+                continue
+            plan, _ = lane_result
+
+            candidates.append(
+                (
+                    plan["total"],
+                    plan["capture_times"][0],
+                    plan["uncertainty"],
+                    action,
+                    pellet,
+                    plan,
+                )
+            )
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[:3])
+        best = candidates[0]
+        return best[3], best[4], best[5]
+
+    def _commit_plan_acceptable(self, plan):
+        if plan is None or len(plan["capture_times"]) != 4:
+            return False
+        return (
+            plan.get("orders_evaluated") == math.factorial(4)
+            and len(set(plan.get("ghost_ids", ()))) == 4
+            and plan["capture_times"][0] <= COMMIT_FIRST_CAPTURE_BUDGET
+            and plan["total"] <= COMMIT_TOTAL_BUDGET
+        )
+
+    def _activation_ghost_after_first_frame(self, ghost, maze):
+        x, y = self._strike_ghost_next_pixel(ghost, maze)
+        row, col = self._pixel_cell((x, y))
+        projected = dict(ghost)
+        projected.update(
+            {
+                "px": x,
+                "py": y,
+                "grid_r": row,
+                "grid_c": col,
+                "frightened": True,
+                "eaten": False,
+            }
+        )
+        return projected
+
+    def _plan_activation_chain(
+        self,
+        start_cell,
+        start_pixel,
+        indexed_ghosts,
+        maze,
+    ):
+        indexed_ghosts = list(indexed_ghosts)
+        ghost_ids = tuple(
+            ghost_id for ghost_id, _ in indexed_ghosts
+        )
+        if len(indexed_ghosts) != 4 or len(set(ghost_ids)) != 4:
+            return None
+
+        envelopes = {
+            ghost_id: self._frightened_reachable_envelope(ghost, maze)
+            for ghost_id, ghost in indexed_ghosts
+        }
+        best = None
+        orders_evaluated = 0
+        for order in itertools.permutations(ghost_ids):
+            orders_evaluated += 1
+            current_cell = start_cell
+            current_pixel = start_pixel
+            elapsed = 1.0
+            uncertainty = 0.0
+            capture_times = []
+            possible = True
+            for ghost_id in order:
+                intercept = self._best_activation_intercept(
+                    current_cell,
+                    current_pixel,
+                    elapsed,
+                    envelopes[ghost_id],
+                    maze,
+                )
+                if intercept is None:
+                    possible = False
+                    break
+                elapsed, current_cell, added_uncertainty = intercept
+                uncertainty += added_uncertainty
+                conservative_capture = elapsed + uncertainty
+                capture_times.append(conservative_capture)
+                current_pixel = self._cell_center(current_cell)
+
+            if not possible:
+                continue
+            candidate = {
+                "total": capture_times[-1],
+                "raw": elapsed,
+                "uncertainty": uncertainty,
+                "order": tuple(order),
+                "capture_times": tuple(capture_times),
+                "ghost_ids": ghost_ids,
+                "orders_evaluated": 0,
+            }
+            key = (
+                candidate["total"],
+                candidate["capture_times"][1],
+                candidate["uncertainty"],
+                candidate["order"],
+            )
+            if best is None or key < best[0]:
+                best = (key, candidate)
+        if best is None:
+            return None
+        best[1]["orders_evaluated"] = orders_evaluated
+        return best[1]
+
+    def _best_activation_intercept(
+        self,
+        pac_cell,
+        pac_pixel,
+        elapsed_frames,
+        envelope,
+        maze,
+    ):
+        best = None
+        for ghost_frames, cell, uncertainty in envelope:
+            distance = self._distance(pac_cell, cell, maze)
+            if distance is None:
+                continue
+
+            route_pixels = self._wrapped_distance(
+                pac_pixel, self._cell_center(pac_cell)
+            )
+            route_pixels += distance * CELL
+            travel = max(
+                0.0,
+                route_pixels / PACMAN_SPEED
+                - COLLISION_RADIUS / PACMAN_SPEED,
+            )
+            arrival = elapsed_frames + travel
+            ghost_time = 1.0 + ghost_frames
+            finish = max(arrival, ghost_time)
+            timing_error = abs(ghost_time - arrival)
+            candidate = (
+                finish,
+                cell,
+                uncertainty + min(14.0, timing_error * 0.08),
+            )
+            if best is None or candidate < best:
+                best = candidate
+        return best
+
+    def _plan_capture_chain(
+        self,
+        start,
+        indexed_ghosts,
+        maze,
+        forced_first=None,
+    ):
+        indexed_ghosts = list(indexed_ghosts)
+        if not indexed_ghosts:
+            return None
+
+        ghosts = {ghost_id: ghost for ghost_id, ghost in indexed_ghosts}
+        ghost_ids = tuple(ghosts)
+        if forced_first is not None and forced_first not in ghosts:
+            return None
+
+        envelopes = {
+            ghost_id: self._frightened_reachable_envelope(ghost, maze)
+            for ghost_id, ghost in indexed_ghosts
+        }
+        if forced_first is None:
+            orders = itertools.permutations(ghost_ids)
+        else:
+            rest = tuple(
+                ghost_id for ghost_id in ghost_ids
+                if ghost_id != forced_first
+            )
+            orders = (
+                (forced_first,) + suffix
+                for suffix in itertools.permutations(rest)
+            )
+
+        best = None
+        for order in orders:
+            current = start
+            elapsed = 0.0
+            uncertainty = 0.0
+            possible = True
+            for ghost_id in order:
+                intercept = self._best_envelope_intercept(
+                    current,
+                    elapsed,
+                    envelopes[ghost_id],
+                    maze,
+                )
+                if intercept is None:
+                    possible = False
+                    break
+                elapsed = intercept[0]
+                current = intercept[1]
+                uncertainty += intercept[2]
+
+            if not possible:
+                continue
+            conservative = elapsed + uncertainty
+            candidate = (
+                conservative,
+                elapsed,
+                uncertainty,
+                tuple(order),
+            )
+            if best is None or candidate < best:
+                best = candidate
+        return best
+
+    def _frightened_reachable_envelope(self, ghost, maze):
+        start = self._object_cell(ghost)
+        heading = self._heading(ghost)
+        result = [(0.0, start, 2.0)]
+
+        # Frightened ghosts retain their heading initially. Trust only the next
+        # two cells; their hidden scatter timer can force a random turn later.
+        current = start
+        if heading is not None:
+            for step in range(1, 3):
+                nxt = dict(self._neighbors(current, maze)).get(heading)
+                if nxt is None:
+                    break
+                result.append(
+                    (step * CELL / FRIGHTENED_GHOST_SPEED, nxt, 1.0 + step)
+                )
+                current = nxt
+
+        # Beyond the short heading window, target junctions and corridor ends
+        # rather than pretending a random frightened route is deterministic.
+        distances = self._distance_map_from(start, maze, max_depth=7)
+        for cell, steps in distances.items():
+            if steps == 0:
+                continue
+            degree = self._degree(cell, maze)
+            if degree == 2 and steps < 6:
+                continue
+            ghost_frames = steps * CELL / FRIGHTENED_GHOST_SPEED
+            uncertainty = min(16.0, 5.0 + steps * 1.35)
+            result.append((ghost_frames, cell, uncertainty))
+        return result
+
+    def _best_envelope_intercept(
+        self,
+        pac_start,
+        elapsed_frames,
+        envelope,
+        maze,
+    ):
+        best = None
+        for ghost_frames, cell, uncertainty in envelope:
+            distance = self._distance(pac_start, cell, maze)
+            if distance is None:
+                continue
+            travel = max(
+                0.0,
+                distance * CELL / PACMAN_SPEED
+                - COLLISION_RADIUS / PACMAN_SPEED,
+            )
+            arrival = elapsed_frames + travel
+            wait = max(0.0, ghost_frames - arrival)
+            finish = arrival + min(wait, 15.0)
+            timing_error = abs(ghost_frames - arrival)
+            candidate = (
+                finish + timing_error * 0.06,
+                cell,
+                uncertainty + min(10.0, timing_error * 0.05),
+            )
+            if best is None or candidate < best:
+                best = candidate
+        return best
+
+    def _project_ghost_to_activation(
+        self,
+        ghost,
+        ghost_id,
+        pac,
+        maze,
+        frames,
+    ):
+        projected = dict(ghost)
+        x, y = self._object_pixel(ghost)
+        dx = float(ghost.get("dx", 0))
+        dy = float(ghost.get("dy", 0))
+        eaten = bool(ghost.get("eaten", False))
+        frightened = bool(ghost.get("frightened", False))
+
+        for _ in range(min(frames, 240)):
+            speed = (
+                EATEN_GHOST_SPEED
+                if eaten
+                else FRIGHTENED_GHOST_SPEED
+                if frightened
+                else NORMAL_GHOST_SPEED
+            )
+            nx = self._wrap_x(x + dx * speed)
+            ny = y + dy * speed
+            if self._pixel_walkable(nx, ny, maze):
+                x, y = nx, ny
+            else:
+                target = (
+                    {"px": 10.5 * CELL, "py": 9.5 * CELL}
+                    if eaten else pac
+                )
+                direction = self._ghost_turn(
+                    (x, y),
+                    (dx, dy),
+                    target,
+                    maze,
+                    frightened and not eaten,
+                )
+                dr, dc = DIRS[direction]
+                dx, dy = float(dc), float(dr)
+
+            if eaten and self._wrapped_distance(
+                (x, y), (10.5 * CELL, 9.5 * CELL)
+            ) < CELL * 0.6:
+                x, y = self._ghost_spawn_pixel(ghost_id)
+                dx, dy = -1.0, 0.0
+                eaten = False
+                frightened = False
+
+        projected.update(
+            {
+                "px": x,
+                "py": y,
+                "grid_r": self._pixel_cell((x, y))[0],
+                "grid_c": self._pixel_cell((x, y))[1],
+                "dx": dx,
+                "dy": dy,
+                # The pellet makes every ghost frightened and revives eyes.
+                "frightened": True,
+                "eaten": False,
+            }
+        )
+        return projected
+
+    def _unsafe_respawn_before_pellet(
+        self,
+        path,
+        approach_frames,
+        ghosts,
+        maze,
+    ):
+        for ghost_id, ghost in enumerate(ghosts):
+            if not ghost.get("eaten", False):
+                continue
+            eta = self._eaten_respawn_eta(ghost, maze)
+            if eta is None or eta > approach_frames:
+                continue
+
+            spawn = self._pixel_cell(self._ghost_spawn_pixel(ghost_id))
+            closest = min(
+                (
+                    self._distance(cell, spawn, maze)
+                    for cell in path
+                    if self._distance(cell, spawn, maze) is not None
+                ),
+                default=99,
+            )
+            # Only reject a returning eye when it becomes lethal before Pac-Man
+            # reaches the pellet and the approach passes through its spawn area.
+            if closest <= 2:
+                return True
+        return False
+
+    def _choose_herd_pellet(self, pac_cell, pellets, ghosts, maze):
+        best = None
+        for pellet in pellets:
+            distances = [
+                self._distance(pellet, self._object_cell(g), maze)
+                for g in ghosts
+            ]
+            if not distances or any(d is None for d in distances):
+                continue
+
+            pac_distance = self._distance(pac_cell, pellet, maze) or 999
+            score = (
+                sum(distances)
+                + max(distances) * 2.5
+                + pac_distance * 0.35
+            )
+            candidate = (score, pellet)
+            if best is None or candidate < best:
+                best = candidate
+
+        return best[1] if best else min(pellets)
+
+    def _pellet_approaches(self, pellet, maze):
+        row, col = pellet
+        center_x, center_y = self._cell_center(pellet)
+        approaches = []
+        for action, (dr, dc) in DIRS.items():
+            approach = (row - dr, (col - dc) % self.cols)
+            if not self._walkable(approach, maze):
+                continue
+
+            boundary_x = center_x - dc * CELL / 2.0
+            boundary_y = center_y - dr * CELL / 2.0
+            staging = (
+                boundary_x - dc * 0.5,
+                boundary_y - dr * 0.5,
+            )
+            strike = (
+                staging[0] + dc * PACMAN_SPEED,
+                staging[1] + dr * PACMAN_SPEED,
+            )
+            approaches.append(
+                (approach, action, staging, strike)
+            )
+        return approaches
+
+    def _activation_ghost_signature(self, projected):
+        return tuple(
+            (
+                ghost_id,
+                ghost["grid_r"],
+                ghost["grid_c"],
+                self._heading(ghost),
+            )
+            for ghost_id, ghost in projected
+        )
+
+    def _activation_lane_plans(self, state, pellet, maze):
+        ghosts = state.get("ghosts") or []
+        if len(ghosts) != 4:
+            return {}
+        # A ghost still inside the central respawn chamber must not count
+        # toward the pre-pellet four-ghost qualification. This restriction is
+        # deliberately limited to activation; frightened ghosts remain valid
+        # HUNT targets everywhere after the pellet is consumed.
+        if any(
+            self._in_respawn_chamber(self._object_cell(ghost))
+            for ghost in ghosts
+        ):
+            return {}
+
+        projected = [
+            (
+                ghost_id,
+                self._activation_ghost_after_first_frame(ghost, maze),
+            )
+            for ghost_id, ghost in enumerate(ghosts)
+        ]
+        cache_key = (
+            pellet,
+            self._activation_ghost_signature(projected),
+        )
+        if cache_key in self.activation_plan_cache:
+            return self.activation_plan_cache[cache_key]
+
+        lane_plans = {}
+        for lane in self._pellet_approaches(pellet, maze):
+            strike_pixel = lane[3]
+            if self._pixel_cell(strike_pixel) != pellet:
+                continue
+            plan = self._plan_activation_chain(
+                pellet,
+                strike_pixel,
+                projected,
+                maze,
+            )
+            if not self._commit_plan_acceptable(plan):
+                continue
+            lane_plans[lane[1]] = (plan, lane)
+
+        if len(self.activation_plan_cache) >= 256:
+            self.activation_plan_cache.clear()
+        self.activation_plan_cache[cache_key] = lane_plans
+        return lane_plans
+
+    def _ready_activation_lane(self, state, pellet, maze):
+        lane_plans = self._activation_lane_plans(
+            state, pellet, maze
+        )
+        if not lane_plans:
+            return None
+
+        return min(
+            lane_plans.values(),
+            key=lambda item: (
+                item[0]["total"],
+                item[0]["capture_times"][0],
+                item[0]["uncertainty"],
+                item[1][1],
+            ),
+        )
+
+    def _update_setup_progress(self, state, pellet, ready, maze):
+        if self.setup_pellet != pellet:
+            self.setup_pellet = pellet
+            self.setup_best_metric = float("inf")
+            self.setup_stall_frames = 0
+
+        pac_pixel = self._object_pixel(state["pacman"])
+        approaches = self._pellet_approaches(pellet, maze)
+        staging_distance = min(
+            (
+                self._wrapped_distance(pac_pixel, lane[2])
+                for lane in approaches
+            ),
+            default=self.cols * CELL,
+        )
+
+        if ready is not None:
+            plan, lane = ready
+            staging_distance = self._wrapped_distance(
+                pac_pixel, lane[2]
+            )
+            metric = (
+                plan["total"]
+                + staging_distance / PACMAN_SPEED * 0.35
+            )
+        else:
+            distances = [
+                self._distance(
+                    self._object_cell(ghost), pellet, maze
+                )
+                for ghost in state.get("ghosts") or []
+            ]
+            if len(distances) != 4 or any(
+                distance is None for distance in distances
+            ):
+                metric = float("inf")
+            else:
+                metric = (
+                    1000.0
+                    + max(distances) * 20.0
+                    + sum(distances) * 2.0
+                    + staging_distance * 0.02
+                )
+
+        if metric + 0.25 < self.setup_best_metric:
+            self.setup_best_metric = metric
+            self.setup_stall_frames = 0
+        else:
+            self.setup_stall_frames += 1
+        return self.setup_stall_frames >= SETUP_STALL_LIMIT
+
+    def _lock_prepare_lane(self, state, pellet, maze):
+        approaches = self._pellet_approaches(pellet, maze)
+        if not approaches:
+            self._clear_prepare()
+            return
+
+        pac_cell = self._object_cell(state["pacman"])
+        candidates = []
+        for lane in approaches:
+            approach, action, _, strike_pixel = lane
+            funnel_count = 0
+            funnel_excess = 0
+            strike_distance = 0.0
+            for ghost in state["ghosts"]:
+                ghost_cell = self._object_cell(ghost)
+                to_pellet = self._distance(ghost_cell, pellet, maze)
+                to_approach = self._distance(ghost_cell, approach, maze)
+                if to_pellet is None or to_approach is None:
+                    funnel_excess += 99
+                    continue
+                if to_approach == to_pellet + 1:
+                    funnel_count += 1
+                funnel_excess += abs(to_approach - (to_pellet + 1))
+                strike_distance += self._wrapped_distance(
+                    self._object_pixel(ghost), strike_pixel
+                )
+
+            pac_route = self._distance(pac_cell, approach, maze)
+            candidates.append(
+                (
+                    -funnel_count,
+                    funnel_excess,
+                    strike_distance,
+                    pac_route if pac_route is not None else 999,
+                    action,
+                    lane,
+                )
+            )
+
+        candidates.sort()
+        self.prepare_pellet = pellet
+        self.prepare_lane = candidates[0][-1]
+        self.prepare_frames = 0
+        self.prepare_best_deficit = float("inf")
+
+    def _choose_active_herd_target(self, state, pac_cell, pellet, maze):
+        ghosts = [
+            (index, ghost)
+            for index, ghost in enumerate(state["ghosts"])
+            if not ghost.get("eaten", False)
+            and not ghost.get("frightened", False)
+        ]
+        if not ghosts:
+            self._clear_tow()
+            self.herd_phase = "BAIT"
+            return pac_cell
+
+        distances = {
+            index: self._distance(
+                self._object_cell(ghost), pellet, maze
+            )
+            for index, ghost in ghosts
+        }
+        distances = {
+            index: distance
+            for index, distance in distances.items()
+            if distance is not None
+        }
+        if not distances:
+            self._clear_tow()
+            self.herd_phase = "ACQUIRE_STRAGGLER"
+            return self._choose_herd_patrol_target(
+                pac_cell, pellet, state["ghosts"], maze
+            )
+
+        if pellet != self.tow_pellet:
+            self._clear_tow()
+            self.tow_pellet = pellet
+
+        candidates = {
+            ghost_id: distance
+            for ghost_id, distance in distances.items()
+            if distance > 4
+        }
+        if not candidates:
+            self._clear_tow()
+            self.herd_phase = "BAIT"
+            return self._choose_gather_point(
+                pac_cell, pellet, state["ghosts"], maze
+            )
+
+        if (
+            self.tow_ghost_id not in candidates
+            or self.tow_ghost_id not in dict(ghosts)
+        ):
+            self.tow_ghost_id = max(
+                candidates,
+                key=lambda ghost_id: (
+                    candidates[ghost_id], -ghost_id
+                ),
+            )
+            self.tow_lost_frames = 0
+            self.tow_alignment = "LOST"
+
+        ghost_lookup = dict(ghosts)
+        selected = ghost_lookup[self.tow_ghost_id]
+        selected_cell = self._object_cell(selected)
+        route = self._tow_route_for_ghost(
+            selected, selected_cell, pellet, maze
+        )
+        if len(route) < 2:
+            self.herd_phase = "ACQUIRE_STRAGGLER"
+            self.tow_lost_frames += 1
+            return self._choose_acquire_point(
+                pac_cell,
+                selected_cell,
+                pellet,
+                state["ghosts"],
+                maze,
+            )
+
+        self.tow_route = route
+        selected_distance = distances[self.tow_ghost_id]
+        separation = self._distance(
+            pac_cell, selected_cell, maze
+        )
+        pac_index = (
+            route.index(pac_cell) if pac_cell in route else None
+        )
+        visible = self._corridor_visible(
+            selected_cell, pac_cell, maze
+        )
+        expected = self._direction_between(route[0], route[1])
+        heading = self._heading(selected)
+        heading_correct = heading == expected
+        safely_ahead = (
+            pac_index is not None
+            and 2 <= pac_index <= 6
+            and visible
+        )
+
+        if (
+            separation is None
+            or separation > 6
+            or not safely_ahead
+        ):
+            self.tow_lost_frames += 1
+            self.herd_phase = "ACQUIRE_STRAGGLER"
+            self.tow_alignment = "ACQUIRING"
+            target = self._tow_acquire_target(
+                pac_cell,
+                selected,
+                route,
+                pellet,
+                state["ghosts"],
+                maze,
+            )
+        else:
+            self.tow_lost_frames = 0
+            self.herd_phase = "TOW_STRAGGLER"
+            self.tow_alignment = (
+                "ALIGNED" if heading_correct else "TURN_BEACON"
+            )
+            target = self._tow_lead_target(
+                pac_cell,
+                selected,
+                route,
+                pellet,
+                state["ghosts"],
+                maze,
+            )
+
+        # When the ghost gets dangerously close, pull farther down the route
+        # toward the pellet instead of holding the beacon.
+        pixel_gap = self._wrapped_distance(
+            self._object_pixel(state["pacman"]),
+            self._object_pixel(selected),
+        )
+        if pixel_gap < 50.0:
+            retreat_index = min(4, len(route) - 1)
+            retreat = self._tow_safe_target(
+                route[retreat_index],
+                selected_cell,
+                pellet,
+                state["ghosts"],
+                maze,
+            )
+            if retreat is not None:
+                target = retreat
+                self.tow_alignment = "RETREATING"
+
+        self.herd_ghost = self.tow_ghost_id
+        self.herd_pellet = pellet
+        self.herd_phase_frames += 1
+        self.tow_waypoint = target
+        return target
+
+    def _tow_route_for_ghost(self, ghost, ghost_cell, pellet, maze):
+        heading = self._heading(ghost)
+        if heading is None:
+            return self._shortest_path(ghost_cell, pellet, maze)
+        route = self._non_reversing_path(
+            ghost_cell, heading, pellet, maze
+        )
+        return route or self._shortest_path(
+            ghost_cell, pellet, maze
+        )
+
+    def _non_reversing_path(
+        self,
+        start,
+        heading,
+        target,
+        maze,
+    ):
+        start_state = (start, heading)
+        queue = deque([start_state])
+        parent = {start_state: None}
+        end_state = None
+
+        while queue:
+            cell, current_heading = queue.popleft()
+            if cell == target:
+                end_state = (cell, current_heading)
+                break
+            for action, nxt in self._neighbors(cell, maze):
+                if action == OPPOSITE.get(current_heading):
+                    continue
+                state = (nxt, action)
+                if state in parent:
+                    continue
+                parent[state] = (cell, current_heading)
+                queue.append(state)
+
+        if end_state is None:
+            return []
+        states = [end_state]
+        while parent[states[-1]] is not None:
+            states.append(parent[states[-1]])
+        states.reverse()
+        return [state[0] for state in states]
+
+    def _corridor_visible(self, first, second, maze):
+        if first == second:
+            return True
+        path = self._shortest_path(first, second, maze)
+        if not path:
+            return False
+        same_row = all(cell[0] == first[0] for cell in path)
+        same_col = all(cell[1] == first[1] for cell in path)
+        return same_row or same_col
+
+    def _tow_acquire_target(
+        self,
+        pac_cell,
+        ghost,
+        route,
+        pellet,
+        ghosts,
+        maze,
+    ):
+        ghost_cell = route[0]
+        heading = self._heading(ghost)
+        expected = self._direction_between(route[0], route[1])
+
+        if heading is not None and expected == OPPOSITE.get(heading):
+            beacon = self._tow_turn_beacon(route, maze)
+        else:
+            beacon = route[min(3, len(route) - 1)]
+
+        target = self._tow_safe_target(
+            beacon, ghost_cell, pellet, ghosts, maze
+        )
+        if target is not None:
+            return target
+        return self._choose_acquire_point(
+            pac_cell, ghost_cell, pellet, ghosts, maze
+        )
+
+    def _tow_lead_target(
+        self,
+        pac_cell,
+        ghost,
+        route,
+        pellet,
+        ghosts,
+        maze,
+    ):
+        ghost_cell = route[0]
+        heading = self._heading(ghost)
+        expected = self._direction_between(route[0], route[1])
+        pac_index = route.index(pac_cell) if pac_cell in route else 2
+
+        if heading != expected:
+            candidate = self._tow_turn_beacon(route, maze)
+        else:
+            candidate = route[
+                min(max(3, pac_index + 1), len(route) - 1)
+            ]
+
+        target = self._tow_safe_target(
+            candidate, ghost_cell, pellet, ghosts, maze
+        )
+        if target is not None:
+            return target
+        return route[min(3, len(route) - 1)]
+
+    def _tow_turn_beacon(self, route, maze):
+        if len(route) <= 2:
+            return route[-1]
+        previous_action = self._direction_between(
+            route[0], route[1]
+        )
+        for index in range(1, len(route) - 1):
+            action = self._direction_between(
+                route[index], route[index + 1]
+            )
+            if (
+                action != previous_action
+                or self._degree(route[index], maze) >= 3
+            ):
+                return route[min(index + 2, len(route) - 1)]
+            previous_action = action
+        return route[min(3, len(route) - 1)]
+
+    def _tow_safe_target(
+        self,
+        preferred,
+        selected_cell,
+        pellet,
+        ghosts,
+        maze,
+    ):
+        preferred_to_pellet = self._distance(
+            preferred, pellet, maze
+        )
+        candidates = []
+        for cell in self._open_cells(maze):
+            if self.dead_end_depth.get(cell, 0) > 0:
+                continue
+            if self._degree(cell, maze) < 2:
+                continue
+            to_selected = self._distance(
+                cell, selected_cell, maze
+            )
+            to_pellet = self._distance(cell, pellet, maze)
+            to_preferred = self._distance(cell, preferred, maze)
+            if (
+                to_selected is None
+                or to_pellet is None
+                or to_preferred is None
+            ):
+                continue
+            if not 2 <= to_selected <= 6:
+                continue
+            if (
+                preferred_to_pellet is not None
+                and to_pellet > preferred_to_pellet + 1
+            ):
+                continue
+
+            other_clearance = min(
+                (
+                    self._distance(
+                        cell, self._object_cell(ghost), maze
+                    )
+                    for ghost_id, ghost in enumerate(ghosts)
+                    if ghost_id != self.tow_ghost_id
+                    and not ghost.get("eaten", False)
+                    and self._distance(
+                        cell, self._object_cell(ghost), maze
+                    ) is not None
+                ),
+                default=20,
+            )
+            if other_clearance < 2:
+                continue
+            candidates.append(
+                (
+                    to_preferred * 18
+                    + abs(to_selected - 4) * 12
+                    + to_pellet * 2
+                    - min(other_clearance, 8) * 9
+                    - self._degree(cell, maze) * 4,
+                    cell,
+                )
+            )
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    def _choose_acquire_point(
+        self,
+        pac_cell,
+        ghost_cell,
+        pellet,
+        ghosts,
+        maze,
+    ):
+        ghost_to_pellet = self._distance(ghost_cell, pellet, maze) or 999
+        candidates = []
+        for cell in self._open_cells(maze):
+            to_ghost = self._distance(cell, ghost_cell, maze)
+            to_pellet = self._distance(cell, pellet, maze)
+            if to_ghost is None or to_pellet is None:
+                continue
+            if not 3 <= to_ghost <= 6:
+                continue
+            if to_pellet >= ghost_to_pellet:
+                continue
+            if self.dead_end_depth.get(cell, 0) > 0:
+                continue
+            if self._degree(cell, maze) < 2:
+                continue
+
+            route = self._distance(pac_cell, cell, maze)
+            if route is None:
+                continue
+            clearance = self._normal_ghost_clearance(cell, ghosts, maze)
+            score = (
+                to_ghost * 16
+                + route * 3
+                + to_pellet * 1.5
+                - min(clearance, 8) * 8
+            )
+            candidates.append((score, cell))
+
+        if candidates:
+            candidates.sort()
+            return candidates[0][1]
+        return self._choose_herd_patrol_target(
+            pac_cell, pellet, ghosts, maze
+        )
+
+    def _choose_lead_point(
+        self,
+        pac_cell,
+        ghost_cell,
+        pellet,
+        ghosts,
+        maze,
+    ):
+        ghost_distance = self._distance(ghost_cell, pellet, maze)
+        if ghost_distance is None:
+            return None
+
+        candidates = []
+        for cell in self._open_cells(maze):
+            to_pellet = self._distance(cell, pellet, maze)
+            to_ghost = self._distance(cell, ghost_cell, maze)
+            if to_pellet is None or to_ghost is None:
+                continue
+            if not 2 <= to_pellet <= max(4, ghost_distance - 1):
+                continue
+            if not 2 <= to_ghost <= 6:
+                continue
+            if self.dead_end_depth.get(cell, 0) > 0:
+                continue
+            if self._degree(cell, maze) < 2:
+                continue
+
+            route = self._distance(pac_cell, cell, maze)
+            if route is None:
+                continue
+            clearance = self._normal_ghost_clearance(cell, ghosts, maze)
+            # Remain ahead of the selected ghost while making concrete progress
+            # toward the pellet. Clearance prevents a brave little suicide march.
+            score = (
+                to_pellet * 22
+                + abs(to_ghost - 4) * 18
+                + route * 2
+                - min(clearance, 8) * 9
+            )
+            candidates.append((score, cell))
+
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    def _choose_gather_point(self, pac_cell, pellet, ghosts, maze):
+        recent_cells = {
+            self._pixel_cell(pixel)
+            for pixel in list(self.recent_pixels)[-55:]
+        }
+        candidates = []
+        for cell in self._open_cells(maze):
+            to_pellet = self._distance(cell, pellet, maze)
+            if to_pellet is None or not 2 <= to_pellet <= 4:
+                continue
+            if self.dead_end_depth.get(cell, 0) > 0:
+                continue
+            if self._degree(cell, maze) < 2:
+                continue
+
+            route = self._distance(pac_cell, cell, maze)
+            if route is None:
+                continue
+            ghost_distances = [
+                self._distance(cell, self._object_cell(ghost), maze)
+                for ghost in ghosts
+                if not ghost.get("eaten", False)
+                and not ghost.get("frightened", False)
+            ]
+            ghost_distances = [
+                distance for distance in ghost_distances
+                if distance is not None
+            ]
+            pull = sum(max(0, 9 - distance) for distance in ghost_distances)
+            nearest = min(ghost_distances, default=9)
+            revisit = 70 if cell in recent_cells else 0
+            score = (
+                abs(to_pellet - 3) * 25
+                + route * 3
+                + max(0, 3 - nearest) * 120
+                - pull * 7
+                + revisit
+            )
+            candidates.append((score, cell))
+
+        if not candidates:
+            return pac_cell
+        candidates.sort()
+        return candidates[0][1]
+
+    def _normal_ghost_clearance(self, cell, ghosts, maze):
+        distances = [
+            self._distance(cell, self._object_cell(ghost), maze)
+            for ghost in ghosts
+            if not ghost.get("eaten", False)
+            and not ghost.get("frightened", False)
+        ]
+        distances = [distance for distance in distances if distance is not None]
+        return min(distances, default=20)
+
+    def _ghost_heading_toward_pacman(self, ghost, pac):
+        gx, gy = self._object_pixel(ghost)
+        px, py = self._object_pixel(pac)
+        dx = ghost.get("dx", 0)
+        dy = ghost.get("dy", 0)
+        current = self._wrapped_distance((gx, gy), (px, py))
+        future = self._wrapped_distance(
+            (self._wrap_x(gx + dx * 6), gy + dy * 6),
+            (px, py),
+        )
+        return future < current
+
+    def _choose_herd_patrol_target(self, pac_cell, pellet, ghosts, maze):
+        if pellet is None:
+            return pac_cell
+
+        ring = []
+        for cell in self._open_cells(maze):
+            distance = self._distance(cell, pellet, maze)
+            if distance is None or not 2 <= distance <= 5:
+                continue
+            if self.dead_end_depth.get(cell, 0) > 0:
+                continue
+            if self._degree(cell, maze) < 2:
+                continue
+            ring.append(cell)
+
+        if not ring:
+            return pac_cell
+
+        ghost_cells = [
+            self._object_cell(g)
+            for g in ghosts
+            if not g.get("eaten", False)
+        ]
+        recent_cells = {
+            self._pixel_cell(pixel)
+            for pixel in list(self.recent_pixels)[-40:]
+        }
+
+        def score(cell):
+            ghost_distance = min(
+                (
+                    self._distance(cell, ghost, maze)
+                    for ghost in ghost_cells
+                    if self._distance(cell, ghost, maze) is not None
+                ),
+                default=20,
+            )
+            approach = self._distance(pac_cell, cell, maze) or 999
+            pull = sum(
+                max(0, 9 - (self._distance(cell, ghost, maze) or 20))
+                for ghost in ghost_cells
+            )
+            revisit = 80 if cell in recent_cells else 0
+            return (
+                min(ghost_distance, 8) * 30
+                + pull * 5
+                + self._degree(cell, maze) * 25
+                - approach * 4
+                - revisit
+            )
+
+        return max(ring, key=lambda cell: (score(cell), cell))
+
+    def _safest_food_target(self, start, targets, dangerous, maze):
+        if not targets:
+            return None
+
+        ghost_cells = [self._object_cell(g) for g in dangerous]
+        best = None
+        for target in targets:
+            distance = self._distance(start, target, maze)
+            if distance is None:
+                continue
+            ghost_clearance = min(
+                (
+                    self._distance(target, ghost, maze)
+                    for ghost in ghost_cells
+                    if self._distance(target, ghost, maze) is not None
+                ),
+                default=20,
+            )
+            dead_depth = self.dead_end_depth.get(target, 0)
+            trap = self._multi_ghost_trap_info(
+                target,
+                start,
+                dangerous,
+                maze,
+            )
+            value = (
+                distance
+                + dead_depth * 3
+                - min(ghost_clearance, 8) * 0.7
+                + trap["risk"] * TRAP_TARGET_COST_SCALE
+            )
+            candidate = (value, target)
+            if best is None or candidate < best:
+                best = candidate
+        return best[1] if best else None
+
+    # ------------------------------------------------------------------
+    # Frightened ghost interception
+    # ------------------------------------------------------------------
+
+    def _choose_frightened_intercept(self, state, pac_cell, edible, maze):
+        timer = max(0, state.get("powerTimer", 0))
+        edible_by_id = dict(edible)
+
+        if not self.hunt_active:
+            self.hunt_active = True
+            self.hunt_captured = {
+                ghost_id
+                for ghost_id, ghost in enumerate(state["ghosts"])
+                if ghost.get("eaten", False)
+            }
+
+        remaining = [
+            (ghost_id, edible_by_id[ghost_id])
+            for ghost_id in self.hunt_order
+            if ghost_id in edible_by_id
+            and ghost_id not in self.hunt_captured
+        ]
+        known = {ghost_id for ghost_id, _ in remaining}
+        remaining.extend(
+            (ghost_id, ghost)
+            for ghost_id, ghost in edible
+            if ghost_id not in known
+            and ghost_id not in self.hunt_captured
+        )
+        if not remaining:
+            self.hunt_target = None
+            return self._object_cell(edible[0][1])
+
+        remaining_ids = {ghost_id for ghost_id, _ in remaining}
+        must_replan = (
+            self.hunt_replan_needed
+            or self.hunt_target not in remaining_ids
+        )
+        if must_replan:
+            plan = self._plan_capture_chain(pac_cell, remaining, maze)
+            if plan is not None:
+                planned_remaining = list(plan[3])
+                completed_prefix = [
+                    ghost_id for ghost_id in self.hunt_order
+                    if ghost_id in self.hunt_captured
+                ]
+                self.hunt_order = completed_prefix + planned_remaining
+                self.hunt_target = planned_remaining[0]
+            else:
+                self.hunt_target = min(
+                    remaining,
+                    key=lambda item: (
+                        self._distance(
+                            pac_cell, self._object_cell(item[1]), maze
+                        )
+                        or 999,
+                        item[0],
+                    ),
+                )[0]
+            self.hunt_replan_needed = False
+
+        ranked = self._rank_hunt_targets(
+            timer, pac_cell, remaining, maze
+        )
+        if not ranked:
+            if timer < HUNT_PRESSURE_MIN_TIMER:
+                self._clear_hunt_focus()
+                return None
+            pressure = self._pressure_hunt_focus(
+                timer, pac_cell, remaining, maze
+            )
+            if pressure is None:
+                self._clear_hunt_focus()
+                return None
+            return self._hunt_focus_cell(pressure, pac_cell, maze)
+
+        focus_id = self._select_hunt_focus(ranked)
+        focus = next(
+            item for item in ranked
+            if item["id"] == focus_id
+        )
+        return self._hunt_focus_cell(focus, pac_cell, maze)
+
+    def _rank_hunt_targets(
+        self,
+        timer,
+        pac_cell,
+        remaining,
+        maze,
+    ):
+        safe_window = max(0.0, timer - HUNT_TIMER_MARGIN)
+        ranked = []
+        for ghost_id, ghost in remaining:
+            envelope = self._frightened_reachable_envelope(ghost, maze)
+            intercept = self._best_envelope_intercept(
+                pac_cell, 0.0, envelope, maze
+            )
+            if intercept is None:
+                continue
+
+            finish, _, uncertainty = intercept
+            conservative = finish + uncertainty
+            direct = self._distance(
+                pac_cell, self._object_cell(ghost), maze
+            )
+            if conservative > safe_window:
+                continue
+            ranked.append(
+                {
+                    "id": ghost_id,
+                    "ghost": ghost,
+                    "intercept": intercept,
+                    "conservative": conservative,
+                    "direct": direct if direct is not None else 999,
+                }
+            )
+
+        ranked.sort(
+            key=lambda item: (
+                item["conservative"],
+                item["direct"],
+                item["id"],
+            )
+        )
+        return ranked
+
+    def _pressure_hunt_focus(
+        self,
+        timer,
+        pac_cell,
+        remaining,
+        maze,
+    ):
+        candidates = []
+        for ghost_id, ghost in remaining:
+            direct = self._distance(
+                pac_cell, self._object_cell(ghost), maze
+            )
+            if direct is None:
+                continue
+            pixel_distance = self._wrapped_distance(
+                self._cell_center(pac_cell),
+                self._object_pixel(ghost),
+            )
+            pressure_eta = max(
+                0.0,
+                direct * CELL / PACMAN_SPEED
+                - COLLISION_RADIUS / PACMAN_SPEED,
+            )
+            candidates.append(
+                {
+                    "id": ghost_id,
+                    "ghost": ghost,
+                    "intercept": (
+                        pressure_eta,
+                        self._object_cell(ghost),
+                        0.0,
+                    ),
+                    "conservative": pressure_eta + 12.0,
+                    "direct": direct,
+                    "pressure": True,
+                    "score": (
+                        direct * 30.0
+                        + pixel_distance * 0.25
+                        - timer * 0.08
+                        + ghost_id * 0.01
+                    ),
+                }
+            )
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item["score"])
+        chosen_id = self._select_hunt_focus(candidates)
+        return next(
+            item for item in candidates
+            if item["id"] == chosen_id
+        )
+
+    def _pressure_hunt_target(self, pac_cell, edible, maze):
+        focus = self._pressure_hunt_focus(
+            POWER_FRAMES,
+            pac_cell,
+            edible,
+            maze,
+        )
+        if focus is None:
+            return None
+        return self._hunt_focus_cell(focus, pac_cell, maze)
+
+    def _select_hunt_focus(self, ranked):
+        best = ranked[0]
+        by_id = {item["id"]: item for item in ranked}
+        current_id = (
+            self.hunt_focus_id
+            if self.hunt_focus_id in by_id
+            else self.hunt_target
+            if self.hunt_target in by_id
+            else None
+        )
+
+        if current_id is None:
+            chosen = best
+        else:
+            current = by_id[current_id]
+            best_is_current = best["id"] == current_id
+            best_advantage = (
+                current["conservative"] - best["conservative"]
+            )
+            immediate_capture = (
+                best["direct"] <= 1
+                or best["conservative"] <= 18.0
+            )
+            clearly_better = (
+                not best_is_current
+                and (
+                    best_advantage >= HUNT_SWITCH_ADVANTAGE
+                    or immediate_capture
+                )
+            )
+            sticky = self.hunt_focus_frames < HUNT_STICKY_FRAMES
+            if (
+                best_is_current
+                or (sticky and not clearly_better)
+                or (
+                    not clearly_better
+                    and current["conservative"]
+                    <= best["conservative"] + HUNT_SWITCH_ADVANTAGE
+                )
+            ):
+                chosen = current
+            else:
+                chosen = best
+
+        if self.hunt_focus_id == chosen["id"]:
+            self.hunt_focus_frames += 1
+        else:
+            self.hunt_focus_id = chosen["id"]
+            self.hunt_focus_frames = 0
+            self.hunt_focus_cell = None
+            self.hunt_focus_eta = None
+        return chosen["id"]
+
+    def _hunt_focus_cell(self, focus, pac_cell, maze):
+        ghost = focus["ghost"]
+        pixel_distance = self._wrapped_distance(
+            self._cell_center(pac_cell),
+            self._object_pixel(ghost),
+        )
+        if (
+            focus.get("pressure")
+            or focus["direct"] <= HUNT_NEAR_DIRECT_STEPS
+            or pixel_distance <= HUNT_DIRECT_PIXEL_RADIUS
+            or self._has_clear_hunt_line(pac_cell, ghost, maze)
+        ):
+            target = self._hunt_direct_cell(ghost, maze)
+            self.hunt_focus_cell = target
+            self.hunt_focus_eta = focus["conservative"]
+            return target
+
+        _, candidate_cell, _ = focus["intercept"]
+        candidate_eta = focus["conservative"]
+        if (
+            self.hunt_focus_id == focus["id"]
+            and self.hunt_focus_cell is not None
+            and self._walkable(self.hunt_focus_cell, maze)
+        ):
+            old_distance = self._distance(
+                pac_cell, self.hunt_focus_cell, maze
+            )
+            new_distance = self._distance(
+                pac_cell, candidate_cell, maze
+            )
+            if old_distance is not None and new_distance is not None:
+                old_eta = max(
+                    0.0,
+                    old_distance * CELL / PACMAN_SPEED
+                    - COLLISION_RADIUS / PACMAN_SPEED,
+                )
+                if (
+                    self.hunt_focus_cell != candidate_cell
+                    and old_eta
+                    <= candidate_eta + HUNT_SWITCH_ADVANTAGE * 0.5
+                ):
+                    return self.hunt_focus_cell
+
+        self.hunt_focus_cell = candidate_cell
+        self.hunt_focus_eta = candidate_eta
+        return candidate_cell
+
+    def _has_clear_hunt_line(self, pac_cell, ghost, maze):
+        ghost_cell = self._object_cell(ghost)
+        if pac_cell[0] == ghost_cell[0]:
+            row = pac_cell[0]
+            start = min(pac_cell[1], ghost_cell[1]) + 1
+            end = max(pac_cell[1], ghost_cell[1])
+            return all(maze[row][col] != 1 for col in range(start, end))
+        if pac_cell[1] == ghost_cell[1]:
+            col = pac_cell[1]
+            start = min(pac_cell[0], ghost_cell[0]) + 1
+            end = max(pac_cell[0], ghost_cell[0])
+            return all(maze[row][col] != 1 for row in range(start, end))
+        return False
+
+    def _hunt_direct_cell(self, ghost, maze):
+        current = self._object_cell(ghost)
+        heading = self._heading(ghost)
+        if heading is not None:
+            nxt = dict(self._neighbors(current, maze)).get(heading)
+            if nxt is not None:
+                return nxt
+        return current
+
+    def _respawn_intercept_penalty(
+        self,
+        intercept_cell,
+        pac_frames,
+        ghosts,
+        maze,
+    ):
+        penalty = 0.0
+        for ghost_index, ghost in enumerate(ghosts):
+            if not ghost.get("eaten", False):
+                continue
+            eta = self._eaten_respawn_eta(ghost, maze)
+            if eta is None:
+                continue
+            spawn_cell = self._pixel_cell(
+                self._ghost_spawn_pixel(ghost_index)
+            )
+            distance = self._distance(
+                intercept_cell, spawn_cell, maze
+            )
+            if distance is None or distance > 4:
+                continue
+            timing_gap = abs(pac_frames - eta)
+            if timing_gap <= 90:
+                penalty += (
+                    (5 - distance) * 65.0
+                    + (90 - timing_gap) * 2.0
+                )
+        return penalty
+
+    def _predict_ghost_cells(
+        self,
+        ghost,
+        pac,
+        maze,
+        horizon,
+        frightened,
+    ):
+        x, y = self._object_pixel(ghost)
+        dx = float(ghost.get("dx", 0))
+        dy = float(ghost.get("dy", 0))
+        speed = FRIGHTENED_GHOST_SPEED if frightened else NORMAL_GHOST_SPEED
+        predictions = [(0, self._pixel_cell((x, y)))]
+
+        for frame in range(1, horizon + 1):
+            nx = self._wrap_x(x + dx * speed)
+            ny = y + dy * speed
+            if self._pixel_walkable(nx, ny, maze):
+                x, y = nx, ny
+            else:
+                direction = self._ghost_turn(
+                    (x, y),
+                    (dx, dy),
+                    pac,
+                    maze,
+                    frightened,
+                )
+                dr, dc = DIRS[direction]
+                dx, dy = float(dc), float(dr)
+
+            if frame % 15 == 0:
+                predictions.append((frame, self._pixel_cell((x, y))))
+
+        return predictions
+
+    # ------------------------------------------------------------------
+    # Cell route planning
+    # ------------------------------------------------------------------
+
+    def _desired_direction(
+        self,
+        start,
+        target,
+        maze,
+        ghosts,
+        blocked,
+        mode,
+    ):
+        if target is None or start == target:
+            return None
+
+        path = self._weighted_path(
+            start,
+            target,
+            maze,
+            ghosts,
+            blocked,
+            mode,
+        )
+        if len(path) < 2:
+            return None
+        return self._direction_between(path[0], path[1])
+
+    def _weighted_path(
+        self,
+        start,
+        target,
+        maze,
+        ghosts,
+        blocked,
+        mode,
+    ):
+        if target is None:
+            return []
+
+        queue = [(0.0, 0, start)]
+        counter = 1
+        cost = {start: 0.0}
+        parent = {}
+
+        while queue:
+            _, _, cell = heapq.heappop(queue)
+            if cell == target:
+                break
+
+            for _, nxt in self._neighbors(cell, maze):
+                if nxt in blocked and nxt != target:
+                    continue
+
+                step = 1.0
+                if mode not in ("HUNT", "ARM"):
+                    step += self.dead_end_depth.get(nxt, 0) * 1.7
+
+                pixel = self._cell_center(nxt)
+                projected_pac_frames = (
+                    cost[cell] + step
+                ) * CELL / PACMAN_SPEED
+                if mode != "HUNT":
+                    trap = self._multi_ghost_trap_info(
+                        nxt,
+                        nxt,
+                        ghosts,
+                        maze,
+                        pac_frames=projected_pac_frames,
+                    )
+                    step += trap["risk"] * TRAP_ROUTE_COST_SCALE
+                for ghost_index, ghost in enumerate(ghosts):
+                    if ghost.get("eaten", False):
+                        step += self._respawn_route_penalty(
+                            nxt,
+                            projected_pac_frames,
+                            ghost,
+                            ghost_index,
+                            maze,
+                        )
+                        continue
+                    if ghost.get("frightened", False):
+                        continue
+                    distance = self._wrapped_distance(
+                        pixel,
+                        self._object_pixel(ghost),
+                    )
+                    if distance < CELL * 1.1:
+                        step += 18.0
+                    elif distance < CELL * 2.2:
+                        step += 5.0
+
+                new_cost = cost[cell] + step
+                if new_cost >= cost.get(nxt, float("inf")):
+                    continue
+                cost[nxt] = new_cost
+                parent[nxt] = cell
+                heuristic = self._distance(nxt, target, maze) or 0
+                heapq.heappush(
+                    queue,
+                    (new_cost + heuristic * 0.35, counter, nxt),
+                )
+                counter += 1
+
+        if target not in cost:
+            return []
+
+        path = [target]
+        while path[-1] != start:
+            path.append(parent[path[-1]])
+        path.reverse()
+        return path
+
+    # ------------------------------------------------------------------
+    # Pre-strike positioning and pixel-level safety
+    # ------------------------------------------------------------------
+
+    def _choose_prepare_action(self, state, blocked, maze):
+        if (
+            self.prepare_pellet is None
+            or self.prepare_lane is None
+        ):
+            return self._heading(state["pacman"]) or "UP"
+
+        pac = state["pacman"]
+        pac_pixel = self._object_pixel(pac)
+        current = self._heading(pac)
+        actions = [
+            action for action in MOVE_ORDER
+            if self._command_is_pixel_legal(pac_pixel, action, maze)
+        ]
+        if not actions:
+            return current or "UP"
+
+        evaluations = []
+        for action in actions:
+            pac_trace = self._simulate_pac_trace(
+                pac, action, maze, frames=42
+            )
+            blocked_entry_frame = self._blocked_entry_frame(
+                pac_trace[:1], blocked
+            )
+            assessment = self._trace_assessment(
+                pac_trace,
+                state["ghosts"],
+                pac,
+                maze,
+                "PREPARE",
+            )
+            pac_next = pac_trace[0]
+            trap_cell = self._pixel_cell(
+                pac_trace[min(14, len(pac_trace) - 1)]
+            )
+            projected_ghosts = self._project_ghosts_one_frame(
+                state["ghosts"], pac_next, maze
+            )
+            deficit = self._prepare_state_deficit(
+                pac_next, projected_ghosts, maze
+            )
+            next_cell = self._pixel_cell(pac_next)
+            escape_degree = self._degree(next_cell, maze)
+            dead_depth = self.dead_end_depth.get(next_cell, 0)
+            trap = self._multi_ghost_trap_info(
+                trap_cell,
+                trap_cell,
+                state["ghosts"],
+                maze,
+                pac_frames=15.0,
+            )
+            evaluations.append(
+                {
+                    "action": action,
+                    "blocked": blocked_entry_frame is not None,
+                    "blocked_frame": (
+                        blocked_entry_frame or (len(pac_trace) + 1)
+                    ),
+                    "first_collision": assessment[2],
+                    "min_clearance": assessment[3],
+                    "escape_degree": escape_degree,
+                    "dead_depth": dead_depth,
+                    "trap_risk": trap["risk"],
+                    "second_clearance": trap["second_clearance"],
+                    "deficit": deficit,
+                    "current": action == current,
+                }
+            )
+
+        early_danger = (
+            self._early_danger(state)
+            or self._multi_ghost_danger(state)
+        )
+        safe = [
+            item for item in evaluations
+            if not item["blocked"]
+            and item["first_collision"] > 42
+        ]
+        if early_danger or not safe:
+            return self._emergency_action(evaluations)
+
+        safe.sort(
+            key=lambda item: (
+                item["deficit"],
+                item["trap_risk"],
+                -item["min_clearance"],
+                -item["escape_degree"],
+                item["dead_depth"],
+                not item["current"],
+            )
+        )
+        chosen = safe[0]
+        self.prepare_best_deficit = min(
+            self.prepare_best_deficit, chosen["deficit"]
+        )
+        return chosen["action"]
+
+    def _prepare_state_deficit(self, pac_pixel, ghosts, maze):
+        _, entry_action, staging, strike_pixel = self.prepare_lane
+        staging_distance = self._wrapped_distance(
+            pac_pixel, staging
+        )
+        ghost_deficits = []
+        for ghost in ghosts:
+            projected = self._strike_ghost_next_pixel(ghost, maze)
+            distance = math.hypot(
+                strike_pixel[0] - projected[0],
+                strike_pixel[1] - projected[1],
+            )
+            ghost_deficits.append(
+                max(0.0, distance - STRIKE_RADIUS)
+            )
+
+        # Once Pac-Man reaches the staging pixel, the next entry command is the
+        # exact command checked by _guaranteed_strike_action.
+        ready_distance = PACMAN_SPEED * 0.75
+        staging_penalty = max(
+            0.0, staging_distance - ready_distance
+        )
+        spread = max(ghost_deficits, default=0.0)
+        total = sum(ghost_deficits)
+        alignment_penalty = (
+            0.0
+            if self._heading_from_pixels(pac_pixel, staging) == entry_action
+            else 2.0
+        )
+        return (
+            staging_penalty * 4.0
+            + spread * 3.0
+            + total
+            + alignment_penalty
+        )
+
+    def _heading_from_pixels(self, first, second):
+        dx = second[0] - first[0]
+        width = self.cols * CELL
+        if abs(dx) > width / 2:
+            dx = -math.copysign(width - abs(dx), dx)
+        dy = second[1] - first[1]
+        if abs(dx) > abs(dy) and abs(dx) > 0.5:
+            return "RIGHT" if dx > 0 else "LEFT"
+        if abs(dy) > 0.5:
+            return "DOWN" if dy > 0 else "UP"
+        return None
+
+    def _project_ghosts_one_frame(self, ghosts, pac_next, maze):
+        projected = []
+        pac_target = {"px": pac_next[0], "py": pac_next[1]}
+        for ghost_index, ghost in enumerate(ghosts):
+            item = dict(ghost)
+            x, y = self._object_pixel(ghost)
+            dx = float(ghost.get("dx", 0))
+            dy = float(ghost.get("dy", 0))
+            eaten = bool(ghost.get("eaten", False))
+            frightened = bool(ghost.get("frightened", False))
+            speed = (
+                EATEN_GHOST_SPEED
+                if eaten
+                else FRIGHTENED_GHOST_SPEED
+                if frightened
+                else NORMAL_GHOST_SPEED
+            )
+            nx = self._wrap_x(x + dx * speed)
+            ny = y + dy * speed
+            if self._pixel_walkable(nx, ny, maze):
+                x, y = nx, ny
+            else:
+                target = (
+                    {"px": 10.5 * CELL, "py": 9.5 * CELL}
+                    if eaten else pac_target
+                )
+                direction = self._ghost_turn(
+                    (x, y),
+                    (dx, dy),
+                    target,
+                    maze,
+                    frightened and not eaten,
+                )
+                dr, dc = DIRS[direction]
+                dx, dy = float(dc), float(dr)
+
+            if eaten and self._wrapped_distance(
+                (x, y), (10.5 * CELL, 9.5 * CELL)
+            ) < CELL * 0.6:
+                x, y = self._ghost_spawn_pixel(ghost_index)
+                dx, dy = -1.0, 0.0
+                eaten = False
+                frightened = False
+
+            row, col = self._pixel_cell((x, y))
+            item.update(
+                {
+                    "px": x,
+                    "py": y,
+                    "grid_r": row,
+                    "grid_c": col,
+                    "dx": dx,
+                    "dy": dy,
+                    "eaten": eaten,
+                    "frightened": frightened,
+                }
+            )
+            projected.append(item)
+        return projected
+
+    def _blocked_entry_frame(self, pac_trace, blocked):
+        return next(
+            (
+                frame
+                for frame, pixel in enumerate(pac_trace, start=1)
+                if self._pixel_cell(pixel) in blocked
+            ),
+            None,
+        )
+
+    def _trace_assessment(
+        self,
+        pac_trace,
+        ghosts,
+        pac,
+        maze,
+        mode,
+        power_timer=None,
+    ):
+        risk = 0.0
+        collision = False
+        first_collision = len(pac_trace) + 1
+        min_clearance = float("inf")
+        capture_frame = None
+        ghost_traces = [
+            self._simulate_ghost_trace(
+                ghost,
+                ghost_index,
+                pac_trace,
+                pac,
+                maze,
+                len(pac_trace),
+                power_timer if mode == "HUNT" else None,
+            )
+            for ghost_index, ghost in enumerate(ghosts)
+        ]
+        for ghost, trace in zip(ghosts, ghost_traces):
+            for frame, (pac_pixel, ghost_state) in enumerate(
+                zip(pac_trace, trace), start=1
+            ):
+                ghost_pixel, lethal = ghost_state
+                distance = self._wrapped_distance(
+                    pac_pixel, ghost_pixel
+                )
+                if not lethal:
+                    edible = (
+                        ghost.get("frightened", False)
+                        and not ghost.get("eaten", False)
+                    )
+                    if mode == "HUNT" and edible:
+                        if (
+                            distance < COLLISION_RADIUS
+                            and capture_frame is None
+                        ):
+                            capture_frame = frame
+                        risk -= max(
+                            0.0,
+                            COLLISION_RADIUS + 8 - distance,
+                        ) * 0.45
+                    continue
+                min_clearance = min(min_clearance, distance)
+                if (
+                    distance < COLLISION_RADIUS
+                    and first_collision > len(pac_trace)
+                ):
+                    first_collision = frame
+                    collision = True
+
+                uncertainty = min(10.0, frame * 0.22)
+                margin = COLLISION_RADIUS + uncertainty
+                if distance < COLLISION_RADIUS:
+                    risk += 500.0
+                elif distance < margin + 18:
+                    risk += (margin + 18 - distance) * (
+                        1.2 - min(frame, 35) / 70.0
+                    )
+
+        return risk, collision, first_collision, min_clearance, capture_frame
+
+    def _early_danger(self, state):
+        pac_pixel = self._object_pixel(state["pacman"])
+        lethal = [
+            ghost for ghost in state["ghosts"]
+            if not ghost.get("frightened", False)
+            and not ghost.get("eaten", False)
+        ]
+        nearest = min(
+            (
+                self._wrapped_distance(
+                    pac_pixel, self._object_pixel(ghost)
+                )
+                for ghost in lethal
+            ),
+            default=float("inf"),
+        )
+        return nearest < COLLISION_RADIUS + CELL * 1.15
+
+    def _lethal_ghosts(self, ghosts):
+        return [
+            ghost for ghost in ghosts
+            if not ghost.get("frightened", False)
+            and not ghost.get("eaten", False)
+        ]
+
+    def _ghost_arrival_frames(self, ghost, cell, maze):
+        distance = self._distance(
+            self._object_cell(ghost), cell, maze
+        )
+        if distance is None:
+            return float("inf")
+        pixel_remainder = self._wrapped_distance(
+            self._object_pixel(ghost),
+            self._cell_center(self._object_cell(ghost)),
+        )
+        return max(
+            0.0,
+            distance * CELL / NORMAL_GHOST_SPEED
+            - COLLISION_RADIUS / NORMAL_GHOST_SPEED
+            - pixel_remainder / NORMAL_GHOST_SPEED,
+        )
+
+    def _multi_ghost_trap_info(
+        self,
+        cell,
+        pac_cell,
+        ghosts,
+        maze,
+        pac_frames=0.0,
+    ):
+        lethal = self._lethal_ghosts(ghosts)
+        empty = {
+            "risk": 0.0,
+            "first_arrival": float("inf"),
+            "second_arrival": float("inf"),
+            "second_clearance": float("inf"),
+            "covered_exits": 0,
+            "pinch": False,
+        }
+        if len(lethal) < 2 or cell is None:
+            return empty
+
+        arrivals = sorted(
+            self._ghost_arrival_frames(ghost, cell, maze)
+            for ghost in lethal
+        )
+        first = arrivals[0]
+        second = arrivals[1]
+        if not math.isfinite(second):
+            return empty
+
+        pac_distance = self._distance(pac_cell, cell, maze)
+        pac_eta = pac_frames
+        if pac_distance is not None:
+            pac_eta += pac_distance * CELL / PACMAN_SPEED
+        first_gap = first - pac_eta
+        second_gap = second - pac_eta
+
+        degree = self._degree(cell, maze)
+        dead_depth = self.dead_end_depth.get(cell, 0)
+        risk = 0.0
+        if second_gap < TRAP_HORIZON_FRAMES:
+            risk += (TRAP_HORIZON_FRAMES - second_gap) * 0.9
+        if first_gap < CELL / PACMAN_SPEED * 2:
+            risk += (CELL / PACMAN_SPEED * 2 - first_gap) * 1.25
+        if dead_depth and second_gap < TRAP_HORIZON_FRAMES + 45:
+            risk += min(dead_depth, 8) * TRAP_DEAD_END_WEIGHT
+        if degree <= 2 and second_gap < TRAP_HORIZON_FRAMES + 30:
+            risk += (3 - degree) * 34.0
+
+        covered_exits = 0
+        for _, exit_cell in self._neighbors(cell, maze):
+            exit_arrival = min(
+                self._ghost_arrival_frames(ghost, exit_cell, maze)
+                for ghost in lethal
+            )
+            if exit_arrival <= pac_eta + TRAP_EXIT_COVER_FRAMES:
+                covered_exits += 1
+        if degree > 0 and covered_exits >= max(1, degree - 1):
+            risk += covered_exits * 22.0
+
+        pinch = (
+            first_gap < TRAP_HORIZON_FRAMES * 0.55
+            and second_gap < TRAP_HORIZON_FRAMES
+            and (degree <= 2 or dead_depth > 0 or covered_exits >= degree)
+        )
+        if pinch:
+            risk += 52.0
+
+        return {
+            "risk": max(0.0, risk),
+            "first_arrival": first,
+            "second_arrival": second,
+            "second_clearance": max(0.0, second_gap),
+            "covered_exits": covered_exits,
+            "pinch": pinch,
+        }
+
+    def _multi_ghost_danger(self, state):
+        if state.get("powered", False):
+            return False
+        pac_cell = self._object_cell(state["pacman"])
+        info = self._multi_ghost_trap_info(
+            pac_cell,
+            pac_cell,
+            state.get("ghosts") or [],
+            state["maze"],
+        )
+        return info["risk"] >= TRAP_EMERGENCY_RISK
+
+    def _emergency_action(self, evaluations):
+        # No bait target appears in this ordering. Survival and pellet
+        # preservation are the only concerns.
+        return max(
+            evaluations,
+            key=lambda item: (
+                not item["blocked"],
+                item["first_collision"],
+                -item.get("trap_risk", 0.0),
+                item.get("second_clearance", float("inf")),
+                item["min_clearance"],
+                item["escape_degree"],
+                -item["dead_depth"],
+                item["blocked_frame"],
+                item["current"],
+            ),
+        )["action"]
+
+    def _choose_pixel_safe_action(
+        self,
+        state,
+        desired,
+        target,
+        blocked,
+        mode,
+    ):
+        maze = state["maze"]
+        pac = state["pacman"]
+        ghosts = state["ghosts"]
+        lives = state.get("lives", 3)
+        current = self._heading(pac)
+        pac_pixel = self._object_pixel(pac)
+        focused_ghost = (
+            state["ghosts"][self.hunt_focus_id]
+            if (
+                mode == "HUNT"
+                and self.hunt_focus_id is not None
+                and 0 <= self.hunt_focus_id < len(state["ghosts"])
+                and state["ghosts"][self.hunt_focus_id].get(
+                    "frightened", False
+                )
+                and not state["ghosts"][self.hunt_focus_id].get(
+                    "eaten", False
+                )
+            )
+            else None
+        )
+
+        actions = [
+            action for action in MOVE_ORDER
+            if self._command_is_pixel_legal(pac_pixel, action, maze)
+        ]
+        if not actions:
+            return current or "UP"
+
+        evaluations = []
+        for action in actions:
+            pac_trace = self._simulate_pac_trace(
+                pac, action, maze, frames=42
+            )
+            (
+                risk,
+                collision,
+                first_collision,
+                min_clearance,
+                capture_frame,
+            ) = self._trace_assessment(
+                pac_trace,
+                ghosts,
+                pac,
+                maze,
+                mode,
+                state.get("powerTimer", POWER_FRAMES),
+            )
+            blocked_entry_frame = self._blocked_entry_frame(
+                pac_trace[:1], blocked
+            )
+            blocked_violation = blocked_entry_frame is not None
+
+            next_pixel = pac_trace[0]
+            next_cell = self._pixel_cell(next_pixel)
+            trap_cell = self._pixel_cell(
+                pac_trace[min(14, len(pac_trace) - 1)]
+            )
+            trap = (
+                self._multi_ghost_trap_info(
+                    trap_cell,
+                    trap_cell,
+                    ghosts,
+                    maze,
+                    pac_frames=15.0,
+                )
+                if mode != "HUNT"
+                else {
+                    "risk": 0.0,
+                    "second_clearance": float("inf"),
+                }
+            )
+            target_progress = 0.0
+            if target is not None:
+                before = self._distance(
+                    self._pixel_cell(pac_pixel), target, maze
+                )
+                after = self._distance(next_cell, target, maze)
+                if before is not None and after is not None:
+                    cell_weight = (
+                        HUNT_TARGET_PROGRESS_WEIGHT
+                        if mode == "HUNT" else 38.0
+                    )
+                    target_progress = (before - after) * cell_weight
+                target_center = self._cell_center(target)
+                pixel_weight = (
+                    HUNT_PIXEL_PROGRESS_WEIGHT
+                    if mode == "HUNT" else 0.8
+                )
+                target_progress += (
+                    self._wrapped_distance(pac_pixel, target_center)
+                    - self._wrapped_distance(next_pixel, target_center)
+                ) * pixel_weight
+            if focused_ghost is not None:
+                ghost_pixel = self._object_pixel(focused_ghost)
+                target_progress += (
+                    self._wrapped_distance(pac_pixel, ghost_pixel)
+                    - self._wrapped_distance(next_pixel, ghost_pixel)
+                ) * HUNT_GHOST_PIXEL_WEIGHT
+
+            direction_bonus = 0.0
+            if action == desired:
+                direction_bonus += 75.0
+            if action == current:
+                direction_bonus += 12.0
+            near_capture = (
+                capture_frame is not None
+                and capture_frame <= 12
+            )
+            if (
+                current
+                and action == OPPOSITE[current]
+                and not (mode == "HUNT" and near_capture)
+            ):
+                direction_bonus -= 18.0
+
+            risk_weight = 9.0 if lives <= 1 else 5.0
+            if mode == "HUNT" and state.get("powerTimer", 0) < 75:
+                risk_weight *= 0.72
+            elif mode == "TOW_STRAGGLER":
+                # Proximity to the locked follower is intentional. Actual
+                # collisions remain hard rejects and early danger still invokes
+                # the target-independent emergency selector.
+                risk_weight = 1.0
+            elif mode == "ACQUIRE_STRAGGLER":
+                risk_weight = 2.0
+            capture_bonus = (
+                max(0.0, 90.0 - capture_frame) * 8.0
+                if capture_frame is not None else 0.0
+            )
+            recent_penalty = self._recent_pixel_penalty(next_pixel)
+            if mode == "HUNT":
+                recent_penalty *= HUNT_RECENT_PIXEL_WEIGHT
+            score = (
+                target_progress
+                + direction_bonus
+                + capture_bonus
+                + self._wall_lane_safety_bonus(
+                    next_pixel, ghosts, maze, mode
+                )
+                - risk * risk_weight
+                - trap["risk"] * TRAP_ACTION_COST_SCALE
+                - recent_penalty
+            )
+            evaluations.append(
+                {
+                    "action": action,
+                    "blocked": blocked_violation,
+                    "blocked_frame": (
+                        blocked_entry_frame or (len(pac_trace) + 1)
+                    ),
+                    "first_collision": first_collision,
+                    "min_clearance": min_clearance,
+                    "escape_degree": self._degree(next_cell, maze),
+                    "dead_depth": self.dead_end_depth.get(next_cell, 0),
+                    "trap_risk": trap["risk"],
+                    "second_clearance": trap["second_clearance"],
+                    "score": score,
+                    "collision": collision,
+                    "risk": risk,
+                    "capture_frame": (
+                        capture_frame or (len(pac_trace) + 1)
+                    ),
+                    "opposite": (
+                        bool(current)
+                        and action == OPPOSITE.get(current)
+                    ),
+                    "current": action == current,
+                }
+            )
+
+        early_danger = (
+            mode in (
+                "BAIT",
+                "PREPARE",
+                "ACQUIRE_STRAGGLER",
+                "TOW_STRAGGLER",
+            )
+            and self._early_danger(state)
+        ) or (
+            mode != "HUNT"
+            and self._multi_ghost_danger(state)
+        )
+        safe = [
+            item for item in evaluations
+            if not item["blocked"]
+            and not item["collision"]
+            and not (lives <= 1 and item["risk"] > 15)
+        ]
+        if mode != "HUNT":
+            low_trap_safe = [
+                item for item in safe
+                if item["trap_risk"] < TRAP_SEVERE_RISK
+            ]
+            if low_trap_safe:
+                safe = low_trap_safe
+        if early_danger or not safe:
+            return self._emergency_action(evaluations)
+
+        safe.sort(
+            key=lambda item: (
+                item["score"], item["current"]
+            ),
+            reverse=True,
+        )
+        chosen = safe[0]
+        if mode == "HUNT":
+            chosen = self._commit_hunt_action(safe, chosen)
+        else:
+            self.hunt_last_action = None
+            self.hunt_action_frames = 0
+        return chosen["action"]
+
+    def _commit_hunt_action(self, safe, chosen):
+        last = self.hunt_last_action
+        if last is not None:
+            previous = next(
+                (
+                    item for item in safe
+                    if item["action"] == last
+                ),
+                None,
+            )
+            if previous is not None:
+                best_score = chosen["score"]
+                sticky = (
+                    self.hunt_action_frames
+                    < HUNT_ACTION_STICKY_FRAMES
+                )
+                near_capture = previous["capture_frame"] <= 12
+                avoid_reverse_loop = (
+                    chosen["action"] == OPPOSITE.get(last)
+                    and chosen["capture_frame"] > 12
+                )
+                close_enough = (
+                    previous["score"]
+                    >= best_score - HUNT_ACTION_SWITCH_ADVANTAGE
+                )
+                if (
+                    near_capture
+                    or avoid_reverse_loop
+                    or (sticky and close_enough)
+                ):
+                    chosen = previous
+
+        if self.hunt_last_action == chosen["action"]:
+            self.hunt_action_frames += 1
+        else:
+            self.hunt_last_action = chosen["action"]
+            self.hunt_action_frames = 0
+        return chosen
+
+    def _simulate_pac_trace(self, pac, command, maze, frames):
+        x, y = self._object_pixel(pac)
+        dx = float(pac.get("dx", 0))
+        dy = float(pac.get("dy", 0))
+        dr, dc = DIRS[command]
+        qdx, qdy = float(dc), float(dr)
+        trace = []
+
+        for _ in range(frames):
+            tx = self._wrap_x(x + qdx * PACMAN_SPEED)
+            ty = y + qdy * PACMAN_SPEED
+            if self._pixel_walkable(tx, ty, maze):
+                dx, dy = qdx, qdy
+
+            nx = self._wrap_x(x + dx * PACMAN_SPEED)
+            ny = y + dy * PACMAN_SPEED
+            if self._pixel_walkable(nx, ny, maze):
+                x, y = nx, ny
+            trace.append((x, y))
+
+        return trace
+
+    def _simulate_ghost_trace(
+        self,
+        ghost,
+        ghost_index,
+        pac_trace,
+        pac,
+        maze,
+        frames,
+        power_timer=None,
+    ):
+        x, y = self._object_pixel(ghost)
+        dx = float(ghost.get("dx", 0))
+        dy = float(ghost.get("dy", 0))
+        frightened = ghost.get("frightened", False)
+        eaten = ghost.get("eaten", False)
+        safe_frightened_frames = (
+            max(0.0, power_timer - HUNT_TIMER_MARGIN)
+            if power_timer is not None else None
+        )
+        speed = (
+            EATEN_GHOST_SPEED
+            if eaten
+            else FRIGHTENED_GHOST_SPEED
+            if frightened
+            else NORMAL_GHOST_SPEED
+        )
+        trace = []
+
+        for frame in range(frames):
+            frame_number = frame + 1
+            if (
+                safe_frightened_frames is not None
+                and frightened
+                and not eaten
+                and frame_number > safe_frightened_frames
+            ):
+                frightened = False
+                speed = NORMAL_GHOST_SPEED
+
+            nx = self._wrap_x(x + dx * speed)
+            ny = y + dy * speed
+            if self._pixel_walkable(nx, ny, maze):
+                x, y = nx, ny
+            else:
+                if eaten:
+                    pac_target = {
+                        "px": 10.5 * CELL,
+                        "py": 9.5 * CELL,
+                    }
+                else:
+                    pac_target = {
+                        "px": pac_trace[min(frame, len(pac_trace) - 1)][0],
+                        "py": pac_trace[min(frame, len(pac_trace) - 1)][1],
+                    }
+                direction = self._ghost_turn(
+                    (x, y),
+                    (dx, dy),
+                    pac_target,
+                    maze,
+                    frightened and not eaten,
+                )
+                dr, dc = DIRS[direction]
+                dx, dy = float(dc), float(dr)
+
+            if eaten and self._wrapped_distance(
+                (x, y),
+                (10.5 * CELL, 9.5 * CELL),
+            ) < CELL * 0.6:
+                x, y = self._ghost_spawn_pixel(ghost_index)
+                dx, dy = -1.0, 0.0
+                eaten = False
+                frightened = False
+                speed = NORMAL_GHOST_SPEED
+
+            trace.append(((x, y), not eaten and not frightened))
+
+        return trace
+
+    def _ghost_spawn_pixel(self, ghost_index):
+        starts = (
+            (9.5 * CELL, 9.5 * CELL),
+            (10.5 * CELL, 9.5 * CELL),
+            (11.5 * CELL, 9.5 * CELL),
+            (10.5 * CELL, 10.5 * CELL),
+        )
+        return starts[ghost_index % len(starts)]
+
+    def _eaten_respawn_eta(self, ghost, maze):
+        if not ghost.get("eaten", False):
+            return None
+        start = self._object_cell(ghost)
+        home = (9, 10)
+        distance = self._distance(start, home, maze)
+        if distance is None:
+            return None
+        pixel_remainder = self._wrapped_distance(
+            self._object_pixel(ghost),
+            self._cell_center(start),
+        )
+        return max(
+            0.0,
+            distance * CELL / EATEN_GHOST_SPEED
+            - COLLISION_RADIUS / EATEN_GHOST_SPEED
+            - pixel_remainder / EATEN_GHOST_SPEED,
+        )
+
+    def _respawn_route_penalty(
+        self,
+        cell,
+        pac_frames,
+        ghost,
+        ghost_index,
+        maze,
+    ):
+        eta = self._eaten_respawn_eta(ghost, maze)
+        if eta is None:
+            return 0.0
+        spawn_cell = self._pixel_cell(
+            self._ghost_spawn_pixel(ghost_index)
+        )
+        spawn_distance = self._distance(cell, spawn_cell, maze)
+        if spawn_distance is None or spawn_distance > 3:
+            return 0.0
+
+        timing_gap = abs(pac_frames - eta)
+        if timing_gap > 75:
+            return 0.0
+        return (
+            (4 - spawn_distance) * 18.0
+            + (75 - timing_gap) * 0.9
+        )
+
+    def _ghost_turn(self, pixel, heading, pac, maze, frightened):
+        x, y = pixel
+        dx, dy = heading
+        reverse = (-dx, -dy)
+        choices = []
+
+        for action in MOVE_ORDER:
+            dr, dc = DIRS[action]
+            ndx, ndy = float(dc), float(dr)
+            if (ndx, ndy) == reverse:
+                continue
+            nx = self._wrap_x(x + ndx * NORMAL_GHOST_SPEED * 5)
+            ny = y + ndy * NORMAL_GHOST_SPEED * 5
+            if not self._pixel_walkable(nx, ny, maze):
+                continue
+
+            if frightened:
+                # Stable pseudo-random ordering approximates frightened turns
+                # without making the planner itself nondeterministic.
+                value = (
+                    int(nx * 17 + ny * 31 + len(self.recent_pixels) * 13)
+                    % 997
+                )
+            else:
+                target = self._object_pixel(pac)
+                value = self._wrapped_distance((nx, ny), target)
+            choices.append((value, action))
+
+        if not choices:
+            for action in MOVE_ORDER:
+                dr, dc = DIRS[action]
+                nx = self._wrap_x(x + dc * NORMAL_GHOST_SPEED)
+                ny = y + dr * NORMAL_GHOST_SPEED
+                if self._pixel_walkable(nx, ny, maze):
+                    return action
+            return "LEFT"
+
+        choices.sort()
+        return choices[0][1]
+
+    def _wall_lane_safety_bonus(self, pac_pixel, ghosts, maze, mode):
+        if mode == "HUNT":
+            return 0.0
+
+        x, y = pac_pixel
+        cell = self._pixel_cell(pac_pixel)
+        center = self._cell_center(cell)
+        bonus = 0.0
+
+        for ghost in ghosts:
+            if ghost.get("eaten", False) or ghost.get("frightened", False):
+                continue
+            gx, gy = self._object_pixel(ghost)
+
+            # Reward occupying the side of a wide corridor farther from a
+            # nearby ghost. This uses real pixel separation instead of treating
+            # a whole grid row or column as uniformly dangerous.
+            if abs(gx - x) < CELL * 2 and abs(gy - y) < CELL * 2:
+                if abs(gx - x) > abs(gy - y):
+                    bonus += abs(y - center[1]) * 0.35
+                else:
+                    bonus += abs(x - center[0]) * 0.35
+
+        return bonus
+
+    def _recent_pixel_penalty(self, pixel):
+        if not self.recent_pixels:
+            return 0.0
+        count = sum(
+            self._wrapped_distance(pixel, previous) < 4.1
+            for previous in self.recent_pixels
+        )
+        return count * 3.5
+
+    # ------------------------------------------------------------------
+    # Graph and geometry helpers
+    # ------------------------------------------------------------------
+
+    def _shortest_path(self, start, target, maze, blocked=frozenset()):
+        if start == target:
+            return [start]
+        queue = deque([start])
+        parent = {start: None}
+
+        while queue:
+            cell = queue.popleft()
+            for _, nxt in self._neighbors(cell, maze):
+                if nxt in blocked and nxt != target:
+                    continue
+                if nxt in parent:
+                    continue
+                parent[nxt] = cell
+                if nxt == target:
+                    path = [target]
+                    while path[-1] != start:
+                        path.append(parent[path[-1]])
+                    path.reverse()
+                    return path
+                queue.append(nxt)
+        return []
+
+    def _distance(self, start, target, maze):
+        if start is None or target is None:
+            return None
+        return self.topology_distances.get(start, {}).get(target)
+
+    def _distance_map_from(self, start, maze, max_depth=None):
+        distances = {start: 0}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            if max_depth is not None and distances[cell] >= max_depth:
+                continue
+            for _, nxt in self._neighbors(cell, maze):
+                if nxt in distances:
+                    continue
+                distances[nxt] = distances[cell] + 1
+                queue.append(nxt)
+        return distances
+
+    def _neighbors(self, cell, maze):
+        cached = self.topology_neighbors.get(cell)
+        if cached is not None:
+            return cached
+        return tuple(self._uncached_neighbors(cell, maze))
+
+    def _uncached_neighbors(self, cell, maze):
+        r, c = cell
+        result = []
+        for action in MOVE_ORDER:
+            dr, dc = DIRS[action]
+            nr = r + dr
+            nc = (c + dc) % self.cols
+            nxt = (nr, nc)
+            if self._walkable(nxt, maze):
+                result.append((action, nxt))
+        return result
+
+    def _build_dead_end_depth(self, maze):
+        cells = set(self._open_cells(maze))
+        adjacency = {
+            cell: {nxt for _, nxt in self._neighbors(cell, maze)}
+            for cell in cells
+        }
+        degree = {cell: len(neighbors) for cell, neighbors in adjacency.items()}
+        queue = deque(cell for cell, value in degree.items() if value <= 1)
+        removed = set()
+        depth = {}
+
+        while queue:
+            cell = queue.popleft()
+            if cell in removed:
+                continue
+            removed.add(cell)
+            remaining = [n for n in adjacency[cell] if n not in removed]
+            depth[cell] = 1 + max(
+                (depth.get(n, 0) for n in adjacency[cell]),
+                default=0,
+            )
+            for nxt in remaining:
+                degree[nxt] -= 1
+                if degree[nxt] == 1:
+                    queue.append(nxt)
+        return depth
+
+    def _degree(self, cell, maze):
+        return len(self._neighbors(cell, maze))
+
+    def _walkable(self, cell, maze):
+        if cell is None:
+            return False
+        r, c = cell
+        return (
+            isinstance(r, int)
+            and isinstance(c, int)
+            and 0 <= r < self.rows
+            and 0 <= c < self.cols
+            and maze[r][c] != 1
+        )
+
+    def _pixel_walkable(self, x, y, maze):
+        return self._walkable(self._pixel_cell((x, y)), maze)
+
+    def _command_is_pixel_legal(self, pixel, action, maze):
+        x, y = pixel
+        dr, dc = DIRS[action]
+        nx = self._wrap_x(x + dc * PACMAN_SPEED)
+        ny = y + dr * PACMAN_SPEED
+        return self._pixel_walkable(nx, ny, maze)
+
+    def _open_cells(self, maze):
+        for r, row in enumerate(maze):
+            for c, value in enumerate(row):
+                if value != 1:
+                    yield (r, c)
+
+    def _find_cells(self, maze, value):
+        return {
+            (r, c)
+            for r, row in enumerate(maze)
+            for c, current in enumerate(row)
+            if current == value
+        }
+
+    def _nearest_cell(self, start, targets, maze):
+        choices = [
+            (self._distance(start, target, maze), target)
+            for target in targets
+        ]
+        choices = [item for item in choices if item[0] is not None]
+        return min(choices)[1] if choices else None
+
+    def _direction_between(self, first, second):
+        for action, (dr, dc) in DIRS.items():
+            nr = first[0] + dr
+            nc = (first[1] + dc) % self.cols
+            if (nr, nc) == second:
+                return action
+        return None
+
+    def _heading(self, obj):
+        dx = obj.get("dx", 0)
+        dy = obj.get("dy", 0)
+        if dx > 0:
+            return "RIGHT"
+        if dx < 0:
+            return "LEFT"
+        if dy > 0:
+            return "DOWN"
+        if dy < 0:
+            return "UP"
+        return None
+
+    def _object_cell(self, obj):
+        if "grid_r" in obj and "grid_c" in obj:
+            return (int(obj["grid_r"]), int(obj["grid_c"]))
+        return self._pixel_cell(self._object_pixel(obj))
+
+    def _object_pixel(self, obj):
+        if "px" in obj and "py" in obj:
+            return (float(obj["px"]), float(obj["py"]))
+        cell = self._object_cell(obj)
+        return self._cell_center(cell)
+
+    def _pixel_cell(self, pixel):
+        x, y = pixel
+        c = int(self._wrap_x(x) / CELL)
+        r = int(y / CELL)
+        return (r, c)
+
+    def _cell_center(self, cell):
+        r, c = cell
+        return ((c + 0.5) * CELL, (r + 0.5) * CELL)
+
+    def _wrap_x(self, x):
+        width = self.cols * CELL
+        return x % width
+
+    def _wrapped_distance(self, first, second):
+        dx = abs(first[0] - second[0])
+        width = self.cols * CELL
+        dx = min(dx, width - dx)
+        dy = first[1] - second[1]
+        return math.hypot(dx, dy)
+
+    def _in_ghost_house(self, cell):
+        return self._in_respawn_chamber(cell)
+
+    def _in_respawn_chamber(self, cell):
+        r, c = cell
+        # Exact central chamber containing all four spawn points and the
+        # GHOST_HOME target. Row 6 and the side corridors count as outside.
+        return 7 <= r <= 10 and 8 <= c <= 12
+
+    def _ghost_identity(self, ghost, fallback):
+        # Ghost array order is stable in the Processing sketch.
+        return fallback
+
+
+_PLANNER = PacmanPlanner()
+
+
 def get_best_move(state):
-    """
-    Analyzes the game state and returns the best move.
-    Uses BFS to find nearest dot while avoiding ghosts.
-    When powered, chases frightened ghosts for bonus points.
-    """
-    maze = state['maze']
-    pr = state['pacman']['grid_r']
-    pc = state['pacman']['grid_c']
-    ghosts = state['ghosts']
-    powered = state.get('powered', False)
-
-    rows = len(maze)
-    cols = len(maze[0])
-
-    # 1. Identify danger zones (only non-frightened, non-eaten ghosts)
-    danger_zones = set()
-    frightened_positions = set()
-
-    for g in ghosts:
-        gr, gc = g['grid_r'], g['grid_c']
-        if g['frightened'] and not g['eaten']:
-            frightened_positions.add((gr, gc))
-        elif not g['eaten']:
-            danger_zones.add((gr, gc))
-            for dr, dc in DIRS.values():
-                danger_zones.add((gr + dr, gc + dc))
-
-    # 2. If powered, try to chase the nearest frightened ghost
-    if powered and frightened_positions:
-        result = bfs_to_targets(pr, pc, maze, rows, cols, danger_zones, frightened_positions)
-        if result:
-            return result
-
-    # 3. Normal mode: BFS to nearest dot or power pellet
-    result = bfs_to_food(pr, pc, maze, rows, cols, danger_zones)
-    if result:
-        return result
-
-    # 4. Relax: BFS ignoring expanded danger zones (just avoid ghost cells)
-    slim_danger = set()
-    for g in ghosts:
-        if not g['frightened'] and not g['eaten']:
-            slim_danger.add((g['grid_r'], g['grid_c']))
-
-    result = bfs_to_food(pr, pc, maze, rows, cols, slim_danger)
-    if result:
-        return result
-
-    # 5. Desperation: BFS with NO danger zones at all
-    result = bfs_to_food(pr, pc, maze, rows, cols, set())
-    if result:
-        return result
-
-    # 6. Last resort: any non-wall move
-    for d_name, (dr, dc) in DIRS.items():
-        nr, nc = pr + dr, pc + dc
-        if nc < 0: nc = cols - 1
-        if nc >= cols: nc = 0
-        if 0 <= nr < rows and maze[nr][nc] != 1:
-            return d_name
-
-    return "UP"
+    """Return one legal movement command for the current game-state packet."""
+    return _PLANNER.choose(state)
 
 
-def bfs_to_food(pr, pc, maze, rows, cols, danger_zones):
-    """BFS to find closest dot (0) or power pellet (2)."""
-    return _bfs(pr, pc, maze, rows, cols, danger_zones,
-                target_check=lambda r, c: maze[r][c] in [0, 2])
-
-
-def bfs_to_targets(pr, pc, maze, rows, cols, danger_zones, target_set):
-    """BFS to find closest cell in target_set."""
-    return _bfs(pr, pc, maze, rows, cols, danger_zones,
-                target_check=lambda r, c: (r, c) in target_set)
-
-
-def _bfs(pr, pc, maze, rows, cols, danger_zones, target_check):
-    """Generic BFS returning the first move direction toward the nearest target."""
-    queue = deque()
-    visited = set()
-    visited.add((pr, pc))
-
-    for d_name, (dr, dc) in DIRS.items():
-        nr, nc = pr + dr, pc + dc
-        if nc < 0: nc = cols - 1
-        if nc >= cols: nc = 0
-        if 0 <= nr < rows and maze[nr][nc] != 1 and (nr, nc) not in danger_zones:
-            if target_check(nr, nc):
-                return d_name
-            queue.append((nr, nc, d_name))
-            visited.add((nr, nc))
-
-    while queue:
-        curr_r, curr_c, first_move = queue.popleft()
-        if target_check(curr_r, curr_c):
-            return first_move
-        for dr, dc in DIRS.values():
-            nr, nc = curr_r + dr, curr_c + dc
-            if nc < 0: nc = cols - 1
-            if nc >= cols: nc = 0
-            if 0 <= nr < rows and maze[nr][nc] != 1 and (nr, nc) not in visited and (nr, nc) not in danger_zones:
-                visited.add((nr, nc))
-                queue.append((nr, nc, first_move))
-
-    return None  # No path found
-
-
-print("AI Logic loaded! Ready to connect.")
+print(
+    "PacmanPlanner loaded: strict four-ghost activation, "
+    "stalled-setup switching, and locked-order hunting."
+)
